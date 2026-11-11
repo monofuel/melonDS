@@ -59,6 +59,7 @@ private:
     alignas(8) u8 OBJWindow[256];
 
     u32 NumSprites;
+    u32 SpritePriorities;
 
     u8* CurBGXMosaicTable;
     array2d<u8, 16, 256> MosaicTable = []() constexpr
