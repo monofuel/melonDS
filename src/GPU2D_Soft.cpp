@@ -18,6 +18,10 @@
 
 #include "GPU_Soft.h"
 #include "GPU_ColorOp.h"
+#if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#include <algorithm>
+#include "GPU_TextNeon.h"
+#endif
 
 namespace melonDS
 {
@@ -40,6 +44,7 @@ void SoftRenderer2D::Reset()
     memset(OBJWindow, 0, sizeof(OBJWindow));
 
     NumSprites = 0;
+    SpritePriorities = 0;
 }
 
 u32 SoftRenderer2D::ColorComposite(int i, u32 val1, u32 val2) const
@@ -447,6 +452,44 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
     u32 pixelsaddr;
     u8 color;
     u32 lastxpos;
+
+#if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    if constexpr (!mosaic)
+    {
+        const bool eightBit = (bgcnt & (1 << 7)) != 0;
+        for (int i = 0; i < 256;)
+        {
+            const u32 xpos = xoff;
+            curtile = *(u16*)&bgvram[(tilemapaddr + ((xpos & 0xF8) >> 2) + ((xpos & widexmask) << 3)) & bgvrammask];
+            curpal = eightBit ? (extpal ? GPU2D.GetBGExtPal(extpalslot, curtile >> 12) : pal)
+                : pal + ((curtile & 0xF000) >> 8);
+            const u32 row = (curtile & (1 << 11)) ? 7 - (yoff & 7) : (yoff & 7);
+            pixelsaddr = tilesetaddr + ((curtile & 0x3FF) << (eightBit ? 6 : 5))
+                + (row << (eightBit ? 3 : 2));
+            const int count = std::min(8 - static_cast<int>(xpos & 7), 256 - i);
+            if (count == 8)
+            {
+                DrawTextTileNeon(BGOBJLine + i, BGOBJLine + 256 + i, WindowMask + i,
+                    bgvram + (pixelsaddr & bgvrammask), curpal, eightBit,
+                    (curtile & (1 << 10)) != 0, bgnum);
+            }
+            else
+            {
+                for (int j = 0; j < count; ++j)
+                {
+                    const u32 tileX = (curtile & (1 << 10)) ? 7 - ((xpos + j) & 7) : ((xpos + j) & 7);
+                    const u8 data = bgvram[(pixelsaddr + (eightBit ? tileX : tileX >> 1)) & bgvrammask];
+                    const u8 index = eightBit ? data : ((data >> ((tileX & 1) * 4)) & 15);
+                    if (index && (WindowMask[i + j] & (1 << bgnum)))
+                        DrawPixel(BGOBJLine + i + j, curpal[index], 0x01000000u << bgnum);
+                }
+            }
+            i += count;
+            xoff += count;
+        }
+        return;
+    }
+#endif
 
     if (bgcnt & (1<<7))
     {
@@ -983,6 +1026,9 @@ void SoftRenderer2D::ApplySpriteMosaicX()
 
 void SoftRenderer2D::InterleaveSprites(u32 prio)
 {
+    if (!(SpritePriorities & (1u << prio)))
+        return;
+
     u32 attrmask = (prio << 16) | OBJ_IsOpaque;
     u16* pal = (u16*)&GPU.Palette[GPU2D.Num ? 0x600 : 0x200];
     u16* extpal = GPU2D.GetOBJExtPal();
@@ -1039,6 +1085,7 @@ void SoftRenderer2D::DrawSprites(u32 line)
     }
 
     NumSprites = 0;
+    SpritePriorities = 0;
     memset(OBJLine, 0, sizeof(OBJLine));
     memset(OBJWindow, 0, sizeof(OBJWindow));
 
@@ -1132,6 +1179,8 @@ void SoftRenderer2D::DrawSpritePixel(int color, u32 pixelattr, s32 xpos)
         if (newisopaque && (!oldisopaque || priocheck))
         {
             OBJLine[xpos] = color | pixelattr;
+            // Keep a conservative set; mosaic only copies priorities already written.
+            SpritePriorities |= 1u << ((pixelattr & OBJ_BGPrioMask) >> 16);
         }
         else if (!newisopaque && !oldisopaque)
         {
