@@ -22,6 +22,8 @@ This remains a work in progress, with emulation and rendering accuracy preserved
 - Cached scheduler deadlines to avoid repeatedly scanning for the next event.
 - Shared AArch64 JIT dispatch tails to reduce housekeeping between compiled blocks.
 - Early geometry FIFO routing through the existing per-word register handler.
+- Skipping clipping passes for polygons already inside the view volume, preserving
+  vertex colour rounding and strip reuse.
 
 [Regression tests](tests/monomelon) cover scheduler ordering, snapshots, generated
 JIT dispatch and rendering. Compiler tuning and open-demo PGO are provided by

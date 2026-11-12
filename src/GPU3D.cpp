@@ -902,6 +902,29 @@ int ClipAgainstPlane(const GPU3D& gpu, Vertex* vertices, int nverts, int clipsta
 template<bool attribs>
 int ClipPolygon(GPU3D& gpu, Vertex* vertices, int nverts, int clipstart)
 {
+    bool inside = nverts >= clipstart;
+    for (int i = clipstart; i < nverts; i++)
+    {
+        const auto& p = vertices[i].Position;
+        if (p[3] < 0 || p[0] < -p[3] || p[0] > p[3] ||
+            p[1] < -p[3] || p[1] > p[3] || p[2] < -p[3] || p[2] > p[3])
+        {
+            inside = false;
+            break;
+        }
+    }
+    if (inside)
+    {
+        // Each clipping pass rounds every surviving vertex, including reused ones.
+        for (int i = 0; i < nverts; i++)
+        {
+            vertices[i].Color[0] |= 0xFFF;
+            vertices[i].Color[1] |= 0xFFF;
+            vertices[i].Color[2] |= 0xFFF;
+        }
+        return nverts;
+    }
+
     // clip.
     // for each vertex:
     // if it's outside, check if the previous and next vertices are inside

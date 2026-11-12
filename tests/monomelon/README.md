@@ -1,5 +1,11 @@
 # monoMelon renderer test
 
+The CMake clipping fixture compares the fast acceptance path against the original
+three clipping passes on 20,000 seeded polygons, plane boundaries, zero W,
+reused strip vertices and both attribute modes. It also exercises actual clipping
+and empty input. The test includes the implementation to access its helper
+templates without adding an engine API.
+
 The `master` branch carries monoMelon changes based on JesseTG/melonDS commit
 `16f127dbb587a73371827ce79689c5d237c4b59b`. It adds the existing ARM64 NEON
 background-tile path and conservative sprite-priority mask from mono-overlay

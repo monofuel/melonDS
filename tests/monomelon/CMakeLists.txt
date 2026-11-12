@@ -18,7 +18,7 @@ get_directory_property(engine_jit DIRECTORY "${engine}" DEFINITION ENABLE_JIT)
 find_package(Threads REQUIRED)
 enable_testing()
 
-set(fixtures Scheduler Snapshots Bands3D FIFO)
+set(fixtures Scheduler Snapshots Bands3D FIFO Clipping)
 if(engine_jit AND engine_architecture STREQUAL "ARM64")
     list(APPEND fixtures Dispatch)
 endif()
