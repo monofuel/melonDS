@@ -66,6 +66,49 @@ exhausts flag/mode/primary-target combinations with secondary targets on/off,
 ordinary/3D/sprite lower layers and window effects on/off. Only groups whose
 outputs are guaranteed unchanged bypass the original scalar compositor.
 
+## Parallel software 3D renderer
+
+The threaded software renderer divides non-shadow frames into three horizontal
+bands. Its existing thread draws rows 0–95; two persistent helpers draw 96–159
+and 160–191 into private buffers. Each publishes completed rows for the 2D
+consumer. Edge marking includes neighbour rows, and completed buffers are joined
+before the next frame can change rendering state. Shadow and shadow-mask frames
+keep a single worker because stencil history crosses scanlines.
+
+Ordered per-row polygon lists avoid testing polygons against rows they never
+reach. Rasterization and colour arithmetic are unchanged. Reset, state loading,
+rendering-off writes and destruction wait for every pending worker.
+
+The standalone tests need no ROM or BIOS files:
+
+```sh
+tests/monomelon/build-bands3d.sh . /tmp/melonds-bands3d-test
+/tmp/melonds-bands3d-test/test-bands3d 120
+c++ -O2 -std=c++17 -Isrc tests/monomelon/TestActivePolygons.cpp -o /tmp/test-active-polygons
+/tmp/test-active-polygons
+```
+
+The band test compares serial, threaded single-worker, two-worker and three-worker
+results: all output rows, both colour/depth/attribute layers, stencil and shadow
+state. It covers band boundaries, fog, antialiasing, clear images, W/Z buffering,
+shadow sequences, identical frames and real GPU power/reset/save-load paths.
+The list test checks the original row predicate, order, extreme ranges and
+maximum capacity. Host race-detector checks and native ARM64 tests provide
+additional coverage; they do not prove every game and hardware transition.
+
+Diagnostic controls are read when the renderer is constructed:
+
+- `MONOMELON_3D_BANDS=0` retains a single 3D worker.
+- `MONOMELON_3D_WORKERS=2` selects two bands; 3 is the default.
+- `MONOMELON_3D_BAND_SPLIT=N` selects the two-worker split, from 1 through 191.
+- `MONOMELON_3D_BAND_SPLITS=A,B` selects three-worker boundaries, with
+  `1 <= A < B <= 191`.
+
+Disabling threaded rendering retains the serial path. The three-worker default
+targets the quad-core handheld; performance on other CPUs needs measurement.
+See the overlay performance document for saved-scene output comparisons and
+player measurements. Full-speed acceptance remains incomplete.
+
 ## GLES compute feasibility probe
 
 From the source root, with EGL/GLES development headers and libraries installed:

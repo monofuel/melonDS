@@ -126,6 +126,10 @@ void GPU::ResetVRAMCache() noexcept
 
 void GPU::Reset() noexcept
 {
+    // A threaded 3D renderer may still be reading the 3D state and VRAM reset below.
+    if (Rend)
+        Rend->Finish3DRendering();
+
     ScreensEnabled = false;
     ScreenSwap = false;
 
@@ -1047,6 +1051,10 @@ void GPU::MapVRAM_I(u32 bank, u8 cnt) noexcept
 
 void GPU::SetPowerCnt(u32 val) noexcept
 {
+    // Rendering off resets state that the threaded 3D renderer may still read.
+    if (!(val & (1<<2)))
+        Rend->Finish3DRendering();
+
     // POWCNT1 effects:
     // * bit0: asplodes hardware??? not tested.
     // * bit1: disables engine A palette and OAM (zero-filled) (TODO: affects mem timings???)

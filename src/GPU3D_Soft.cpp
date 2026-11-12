@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
@@ -30,8 +31,69 @@ namespace melonDS
 void RenderThreadFunc();
 
 
+static bool ReadBandsEnabled()
+{
+    const char* env = getenv("MONOMELON_3D_BANDS");
+    return !(env && env[0] == '0' && env[1] == '\0');
+}
+
+static int ReadBandSplit()
+{
+    const char* env = getenv("MONOMELON_3D_BAND_SPLIT");
+    if (!env || !*env)
+        return SoftRenderer3D::DefaultBandSplit;
+    char* end = nullptr;
+    long v = strtol(env, &end, 10);
+    if (*end != '\0' || v < 1 || v > 191)
+        return SoftRenderer3D::DefaultBandSplit;
+    return (int)v;
+}
+
+static int ReadBandWorkers()
+{
+    const char* env = getenv("MONOMELON_3D_WORKERS");
+    if (env && env[0] == '2' && env[1] == '\0')
+        return 2;
+    if (env && env[0] == '3' && env[1] == '\0')
+        return 3;
+    return SoftRenderer3D::DefaultBandWorkers;
+}
+
+static void ReadBandSplits3(s32* splits)
+{
+    splits[0] = SoftRenderer3D::DefaultBandSplit3A;
+    splits[1] = SoftRenderer3D::DefaultBandSplit3B;
+    const char* env = getenv("MONOMELON_3D_BAND_SPLITS");
+    if (!env || !*env)
+        return;
+    char* end = nullptr;
+    long a = strtol(env, &end, 10);
+    if (end == env || *end != ',')
+        return;
+    const char* second = end + 1;
+    long b = strtol(second, &end, 10);
+    if (end == second || *end != '\0' || a < 1 || a >= b || b > 191)
+        return;
+    splits[0] = (s32)a;
+    splits[1] = (s32)b;
+}
+
+void SoftRenderer3D::WaitPendingFrame()
+{
+    // The render thread always finishes a started frame, whether or not the frame was
+    // aborted, so waiting here cannot deadlock. Every Sema_RenderDone post matches one
+    // FramePending frame, which keeps the semaphore count exact across abort and restart.
+    if (FramePending)
+    {
+        Platform::Semaphore_Wait(Sema_RenderDone);
+        FramePending = false;
+    }
+}
+
 void SoftRenderer3D::StopRenderThread()
 {
+    WaitPendingFrame();
+
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {
         // Tell the render thread to stop drawing new frames, and finish up the current one.
@@ -43,12 +105,62 @@ void SoftRenderer3D::StopRenderThread()
         Platform::Thread_Free(RenderThread);
         RenderThread = nullptr;
     }
+
+    SetHelperCount(0);
+    FrameHelpers = 0;
+}
+
+void SoftRenderer3D::SetHelperCount(int count)
+{
+    for (int k = 0; k < MaxBandHelpers; k++)
+    {
+        if (k < count)
+            StartHelper(k);
+        else
+            StopHelper(k);
+    }
+}
+
+void SoftRenderer3D::StartHelper(int index)
+{
+    if (HelperThreads[index])
+        return;
+
+    if (!Helpers[index])
+        Helpers[index].reset(new SoftRenderer3D(GPU3D, Parent, HelperTag{}));
+
+    SoftRenderer3D& helper = *Helpers[index];
+    Platform::Semaphore_Reset(helper.Sema_RenderStart);
+    Platform::Semaphore_Reset(helper.Sema_RenderDone);
+    Platform::Semaphore_Reset(helper.Sema_ScanlineCount);
+
+    HelperRunning[index] = true;
+    HelperThreads[index] = Platform::Thread_Create([this, index]() {
+        HelperThreadFunc(index);
+    });
+}
+
+void SoftRenderer3D::StopHelper(int index)
+{
+    // Only called with no frame pending, so the helper is idle in Sema_RenderStart.
+    if (HelperThreads[index])
+    {
+        HelperRunning[index] = false;
+        Platform::Semaphore_Post(Helpers[index]->Sema_RenderStart);
+        Platform::Thread_Wait(HelperThreads[index]);
+        Platform::Thread_Free(HelperThreads[index]);
+        HelperThreads[index] = nullptr;
+    }
 }
 
 void SoftRenderer3D::SetupRenderThread()
 {
     if (Threaded)
     {
+        // "Oh, sorry, were you already in the middle of a frame from the last iteration?"
+        // "Tell me when you're done, I'll wait here."
+        WaitPendingFrame();
+
         if (!RenderThreadRunning.load(std::memory_order_relaxed))
         { // If the render thread isn't already running...
             RenderThreadRunning = true; // "Time for work, render thread!"
@@ -57,29 +169,20 @@ void SoftRenderer3D::SetupRenderThread()
             });
         }
 
-        // "Be on standby, but don't start rendering until I tell you to!"
-        Platform::Semaphore_Reset(Sema_RenderStart);
+        SetHelperCount(BandsEnabled ? BandWorkers - 1 : 0);
 
-        // "Oh, sorry, were you already in the middle of a frame from the last iteration?"
-        if (RenderThreadRendering)
-            // "Tell me when you're done, I'll wait here."
-            Platform::Semaphore_Wait(Sema_RenderDone);
-
-        // "All good? Okay, let me give you your training."
-        // "(Maybe you're still the same thread, but I have to tell you this stuff anyway.)"
-
-        // "This is the signal you'll send when you're done with a frame."
-        // "I'll listen for it when I need to show something to the frontend."
+        // No frame is pending, so every remaining token is stale.
         Platform::Semaphore_Reset(Sema_RenderDone);
-
-        // "This is the signal I'll send when I want you to start rendering."
-        // "Don't do anything until you get the message."
         Platform::Semaphore_Reset(Sema_RenderStart);
-
-        // "This is the signal you'll send every time you finish drawing a line."
-        // "I might need some of your scanlines before you finish the whole buffer,"
-        // "so let me know as soon as you're done with each one."
         Platform::Semaphore_Reset(Sema_ScanlineCount);
+        for (auto& helper : Helpers)
+        {
+            if (!helper) continue;
+            Platform::Semaphore_Reset(helper->Sema_RenderDone);
+            Platform::Semaphore_Reset(helper->Sema_RenderStart);
+            Platform::Semaphore_Reset(helper->Sema_ScanlineCount);
+        }
+        FrameHelpers = 0;
     }
     else
     {
@@ -87,10 +190,54 @@ void SoftRenderer3D::SetupRenderThread()
     }
 }
 
+bool SoftRenderer3D::CanBandFrame() const
+{
+    if (FrameIdentical || BandWorkers < 2 || BandWorkers > MaxBandHelpers + 1)
+        return false;
+    for (int k = 0; k < BandWorkers - 1; k++)
+        if (!HelperThreads[k])
+            return false;
+
+    // The two-row stencil buffer carries history across rows and frames, so any frame that
+    // reads or writes it renders as a single band.
+    u32 npolys = GPU3D.RenderNumPolygons;
+    bool any = false;
+    for (u32 i = 0; i < npolys; i++)
+    {
+        const Polygon* polygon = GPU3D.RenderPolygonRAM[i];
+        if (polygon->Degenerate) continue;
+        if (polygon->IsShadowMask || polygon->IsShadow) return false;
+        any = true;
+    }
+    return any;
+}
+
+void SoftRenderer3D::PublishFrameMode()
+{
+    // GetLine reads this mode until the next frame starts. Every caller runs after the 2D
+    // consumer has drained, and before it can see a line from the new frame.
+    if (!CanBandFrame())
+    {
+        FrameHelpers = 0;
+        return;
+    }
+    FrameHelpers = BandWorkers - 1;
+    if (FrameHelpers == 1)
+        FrameStart[0] = BandSplit;
+    else
+    {
+        FrameStart[0] = BandSplits3[0];
+        FrameStart[1] = BandSplits3[1];
+    }
+}
+
 void SoftRenderer3D::EnableRenderThread()
 {
     if (Threaded && Sema_RenderStart)
     {
+        WaitPendingFrame();
+        PublishFrameMode();
+        FramePending = true;
         Platform::Semaphore_Post(Sema_RenderStart);
     }
 }
@@ -105,11 +252,29 @@ SoftRenderer3D::SoftRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent) noex
     RenderThreadRunning = false;
     RenderThreadRendering = false;
     RenderThread = nullptr;
+
+    BandsEnabled = ReadBandsEnabled();
+    BandWorkers = ReadBandWorkers();
+    BandSplit = ReadBandSplit();
+    ReadBandSplits3(BandSplits3);
+}
+
+SoftRenderer3D::SoftRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent, HelperTag) noexcept
+    : SoftRenderer3D(gpu3D, parent)
+{
+    // A helper never owns threads or a helper of its own.
+    BandsEnabled = false;
+    memset(ColorBuffer, 0, sizeof(ColorBuffer));
+    memset(DepthBuffer, 0, sizeof(DepthBuffer));
+    memset(AttrBuffer, 0, sizeof(AttrBuffer));
+    PrevIsShadowMask = false;
 }
 
 SoftRenderer3D::~SoftRenderer3D()
 {
     StopRenderThread();
+    for (auto& helper : Helpers)
+        helper.reset();
 
     Platform::Semaphore_Free(Sema_RenderStart);
     Platform::Semaphore_Free(Sema_RenderDone);
@@ -118,6 +283,9 @@ SoftRenderer3D::~SoftRenderer3D()
 
 void SoftRenderer3D::Reset()
 {
+    // The render thread may still be reading these buffers.
+    WaitPendingFrame();
+
     memset(ColorBuffer, 0, BufferSize * 2 * 4);
     memset(DepthBuffer, 0, BufferSize * 2 * 4);
     memset(AttrBuffer, 0, BufferSize * 2 * 4);
@@ -657,6 +825,13 @@ void SoftRenderer3D::SetupPolygonRightEdge(SoftRenderer3D::RendererPolygon* rp, 
 
 void SoftRenderer3D::SetupPolygon(SoftRenderer3D::RendererPolygon* rp, Polygon* polygon) const
 {
+    SetupPolygon(rp, polygon, polygon->YTop);
+}
+
+// ystart is the first row the caller will rasterize, YTop or later. Slope::Setup computes
+// the edge state at any row directly, so this matches stepping down from YTop.
+void SoftRenderer3D::SetupPolygon(SoftRenderer3D::RendererPolygon* rp, Polygon* polygon, s32 ystart) const
+{
     u32 nverts = polygon->NumVertices;
 
     u32 vtop = polygon->VTop, vbot = polygon->VBottom;
@@ -703,8 +878,8 @@ void SoftRenderer3D::SetupPolygon(SoftRenderer3D::RendererPolygon* rp, Polygon* 
     }
     else
     {
-        SetupPolygonLeftEdge(rp, ytop);
-        SetupPolygonRightEdge(rp, ytop);
+        SetupPolygonLeftEdge(rp, ystart);
+        SetupPolygonRightEdge(rp, ystart);
     }
 }
 
@@ -1394,20 +1569,15 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
     rp->XR = rp->SlopeR.Step();
 }
 
-void SoftRenderer3D::RenderScanline(s32 y, int npolys)
+void SoftRenderer3D::RenderScanline(s32 y)
 {
-    for (int i = 0; i < npolys; i++)
+    for (u32 k = ActiveRows.Offset[y]; k < ActiveRows.Offset[y + 1]; k++)
     {
-        RendererPolygon* rp = &PolygonList[i];
-        Polygon* polygon = rp->PolyData;
-
-        if (y >= polygon->YTop && (y < polygon->YBottom || (y == polygon->YTop && polygon->YBottom == polygon->YTop)))
-        {
-            if (polygon->IsShadowMask)
-                RenderShadowMaskScanline(rp, y);
-            else
-                RenderPolygonScanline(rp, y);
-        }
+        RendererPolygon* rp = &PolygonList[ActiveRows.Index[k]];
+        if (rp->PolyData->IsShadowMask)
+            RenderShadowMaskScanline(rp, y);
+        else
+            RenderPolygonScanline(rp, y);
     }
 }
 
@@ -1620,7 +1790,7 @@ void SoftRenderer3D::ScanlineFinalPass(s32 y)
     }
 }
 
-void SoftRenderer3D::ClearBuffers()
+void SoftRenderer3D::ClearBuffers(int ystart, int yend)
 {
     u32 clearz = ((GPU3D.RenderClearAttr2 & 0x7FFF) * 0x200) + 0x1FF;
     u32 polyid = GPU3D.RenderClearAttr1 & 0x3F000000; // this sets the opaque polygonID
@@ -1656,9 +1826,9 @@ void SoftRenderer3D::ClearBuffers()
     if (GPU3D.RenderDispCnt & (1<<14))
     {
         u8 xoff = (GPU3D.RenderClearAttr2 >> 16) & 0xFF;
-        u8 yoff = (GPU3D.RenderClearAttr2 >> 24) & 0xFF;
+        u8 yoff = ((GPU3D.RenderClearAttr2 >> 24) + ystart) & 0xFF;
 
-        for (int y = 0; y < ScanlineWidth*192; y+=ScanlineWidth)
+        for (int y = ScanlineWidth*ystart; y < ScanlineWidth*yend; y+=ScanlineWidth)
         {
             for (int x = 0; x < 256; x++)
             {
@@ -1696,7 +1866,7 @@ void SoftRenderer3D::ClearBuffers()
 
         polyid |= (GPU3D.RenderClearAttr1 & 0x8000);
 
-        for (int y = 0; y < ScanlineWidth*192; y+=ScanlineWidth)
+        for (int y = ScanlineWidth*ystart; y < ScanlineWidth*yend; y+=ScanlineWidth)
         {
             for (int x = 0; x < 256; x++)
             {
@@ -1718,11 +1888,15 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
         SetupPolygon(&PolygonList[j++], polygons[i]);
     }
 
-    RenderScanline(0, j);
+    ActiveRows.Build(j,
+        [this](int i) { return PolygonList[i].PolyData->YTop; },
+        [this](int i) { return PolygonList[i].PolyData->YBottom; });
+
+    RenderScanline(0);
 
     for (s32 y = 1; y < 192; y++)
     {
-        RenderScanline(y, j);
+        RenderScanline(y);
         ScanlineFinalPass(y-1);
 
         if (threaded)
@@ -1737,14 +1911,146 @@ void SoftRenderer3D::RenderPolygons(bool threaded, Polygon** polygons, int npoly
         Platform::Semaphore_Post(Sema_ScanlineCount);
 }
 
+void SoftRenderer3D::RenderBand(Polygon** polygons, int npolys, s32 rasterStart, s32 rasterEnd, s32 finalStart, s32 finalEnd)
+{
+    // Same per-row work as RenderPolygons, restricted to one band. Polygons that never
+    // reach a rasterized row are skipped; the others keep their relative order.
+    int j = 0;
+    for (int i = 0; i < npolys; i++)
+    {
+        Polygon* polygon = polygons[i];
+        if (polygon->Degenerate) continue;
+
+        s32 ytop = polygon->YTop, ybot = polygon->YBottom;
+        s32 last = (ybot == ytop) ? ytop : (ybot - 1);
+        if (last < rasterStart || ytop >= rasterEnd) continue;
+
+        SetupPolygon(&PolygonList[j++], polygon, std::max(ytop, rasterStart));
+    }
+
+    ActiveRows.Build(j,
+        [this](int i) { return PolygonList[i].PolyData->YTop; },
+        [this](int i) { return PolygonList[i].PolyData->YBottom; });
+
+    for (s32 y = rasterStart; y < rasterEnd; y++)
+    {
+        RenderScanline(y);
+
+        s32 f = y - 1;
+        if (f >= finalStart && f < finalEnd)
+        {
+            ScanlineFinalPass(f);
+            Platform::Semaphore_Post(Sema_ScanlineCount);
+        }
+    }
+
+    s32 f = rasterEnd - 1;
+    if (f >= finalStart && f < finalEnd)
+    {
+        ScanlineFinalPass(f);
+        Platform::Semaphore_Post(Sema_ScanlineCount);
+    }
+}
+
+void SoftRenderer3D::RenderBandedFrame()
+{
+    // Edge marking reads the opaque polygon ID and depth of the rows above and below, so
+    // each band also rasterizes the neighbouring rows of the adjacent bands. Nothing else
+    // in the polygon or final passes reads another row.
+    int nhelpers = FrameHelpers;
+    s32 halo = (GPU3D.RenderDispCnt & (1<<5)) ? 1 : 0;
+
+    // ClearBuffers never touches the bottom layer, so each helper starts from this
+    // context's bottom layer for every row it may rasterize: buffer rows start..end+1,
+    // which covers both halo rows and, for the last band, the bottom border row. Together
+    // with the copy back below, this context then holds exactly the buffers a single-band
+    // frame would produce.
+    for (int k = 0; k < nhelpers; k++)
+    {
+        SoftRenderer3D& helper = *Helpers[k];
+        s32 start = FrameStart[k];
+        s32 end = (k + 1 < nhelpers) ? FrameStart[k + 1] : 192;
+        s32 seedEnd = std::min(end + 2, (s32)NumScanlines);
+        size_t first = BufferSize + (size_t)start * ScanlineWidth;
+        size_t count = (size_t)(seedEnd - start) * ScanlineWidth;
+        memcpy(&helper.ColorBuffer[first], &ColorBuffer[first], count * 4);
+        memcpy(&helper.DepthBuffer[first], &DepthBuffer[first], count * 4);
+        memcpy(&helper.AttrBuffer[first], &AttrBuffer[first], count * 4);
+        helper.PrevIsShadowMask = PrevIsShadowMask;
+        helper.FrameSplit = start;
+        helper.FrameEnd = end;
+        helper.FrameHalo = halo;
+    }
+    for (int k = 0; k < nhelpers; k++)
+        Platform::Semaphore_Post(Helpers[k]->Sema_RenderStart);
+
+    s32 split = FrameStart[0];
+    s32 rasterEnd = split + halo;
+    ClearBuffers(0, rasterEnd);
+    RenderBand(&GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons, 0, rasterEnd, 0, split);
+
+    // This context's final pass may read its halo row until here; only then do the helper
+    // rows overwrite it.
+    for (int k = 0; k < nhelpers; k++)
+        Platform::Semaphore_Wait(Helpers[k]->Sema_RenderDone);
+
+    // Each helper's final rows, plus the bottom border row from the last helper, both
+    // layers. GetLine may still be reading the helper rows, which is a concurrent read, and
+    // it never reads rows of this context at or below the first split during the frame.
+    // Without shadow polygons the stencil buffer is untouched and every rendered polygon row
+    // clears PrevIsShadowMask, so the single-band result is the AND over all bands.
+    for (int k = 0; k < nhelpers; k++)
+    {
+        SoftRenderer3D& helper = *Helpers[k];
+        s32 start = FrameStart[k];
+        s32 copyEnd = (k + 1 < nhelpers) ? FrameStart[k + 1] + 1 : (s32)NumScanlines;
+        size_t first = (size_t)(start + 1) * ScanlineWidth;
+        size_t count = (size_t)(copyEnd - (start + 1)) * ScanlineWidth;
+        for (size_t layer = 0; layer < 2; layer++)
+        {
+            size_t o = first + layer * BufferSize;
+            memcpy(&ColorBuffer[o], &helper.ColorBuffer[o], count * 4);
+            memcpy(&DepthBuffer[o], &helper.DepthBuffer[o], count * 4);
+            memcpy(&AttrBuffer[o], &helper.AttrBuffer[o], count * 4);
+        }
+        PrevIsShadowMask = PrevIsShadowMask && helper.PrevIsShadowMask;
+    }
+}
+
+void SoftRenderer3D::RenderHelperBand()
+{
+    s32 rasterStart = FrameSplit - FrameHalo;
+    s32 rasterEnd = std::min(FrameEnd + FrameHalo, (s32)192);
+    ClearBuffers(rasterStart, rasterEnd);
+    RenderBand(&GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons, rasterStart, rasterEnd, FrameSplit, FrameEnd);
+}
+
+void SoftRenderer3D::HelperThreadFunc(int index)
+{
+    SoftRenderer3D& helper = *Helpers[index];
+    for (;;)
+    {
+        Platform::Semaphore_Wait(helper.Sema_RenderStart);
+        if (!HelperRunning[index]) return;
+
+        helper.RenderHelperBand();
+
+        Platform::Semaphore_Post(helper.Sema_RenderDone);
+    }
+}
+
 void SoftRenderer3D::FinishRendering()
 {
-    if (RenderThreadRunning.load(std::memory_order_relaxed) && !GPU3D.AbortFrame)
-        Platform::Semaphore_Wait(Sema_RenderDone);
+    // Also wait for aborted frames: GPU3D::VBlank replaces the polygon list and render
+    // state right after this, and the render thread may still be reading them.
+    WaitPendingFrame();
 }
 
 void SoftRenderer3D::RenderFrame()
 {
+    // A frame started by EnableRenderThread may still be running.
+    WaitPendingFrame();
+
     auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
     auto texPalDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
 
@@ -1755,6 +2061,8 @@ void SoftRenderer3D::RenderFrame()
 
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {
+        PublishFrameMode();
+        FramePending = true;
         // "Render thread, you're up! Get moving."
         Platform::Semaphore_Post(Sema_RenderStart);
     }
@@ -1779,16 +2087,14 @@ void SoftRenderer3D::RenderThreadFunc()
         Platform::Semaphore_Wait(Sema_RenderStart);
         if (!RenderThreadRunning) return;
 
-        // Protect the GPU state from the main thread.
-        // Some melonDS frontends (though not ours)
-        // will repeatedly save or load states;
-        // if they do so while the render thread is busy here,
-        // the ensuing race conditions may cause a crash
-        // (since some of the GPU state includes pointers).
         RenderThreadRendering = true;
         if (FrameIdentical)
         { // If no rendering is needed, just say we're done.
             Platform::Semaphore_Post(Sema_ScanlineCount, 192);
+        }
+        else if (FrameHelpers)
+        {
+            RenderBandedFrame();
         }
         else
         {
@@ -1796,11 +2102,11 @@ void SoftRenderer3D::RenderThreadFunc()
             RenderPolygons(true, &GPU3D.RenderPolygonRAM[0], GPU3D.RenderNumPolygons);
         }
 
+        RenderThreadRendering = false;
+
         // Tell the main thread that we're done rendering
         // and that it's safe to access the GPU state again.
         Platform::Semaphore_Post(Sema_RenderDone);
-
-        RenderThreadRendering = false;
     }
 }
 
@@ -1818,16 +2124,29 @@ u32* SoftRenderer3D::GetLine(int line, u16 xpos, bool abortFrame)
         return ScrolledLine;
     }
 
+    u32* buffer = ColorBuffer;
     if (RenderThreadRunning.load(std::memory_order_relaxed))
     {
         if (line < 192)
-            // We need a scanline, so let's wait for the render thread to finish it.
-            // (both threads process scanlines from top-to-bottom,
-            // so we don't need to wait for a specific row)
-            Platform::Semaphore_Wait(Sema_ScanlineCount);
+        {
+            // We need a scanline, so let's wait for the thread drawing it to finish it.
+            // Each band is drawn top-to-bottom and lines are read in order, so each
+            // semaphore only needs to count rows.
+            SoftRenderer3D* band = this;
+            for (int k = FrameHelpers - 1; k >= 0; k--)
+            {
+                if (line >= FrameStart[k])
+                {
+                    band = Helpers[k].get();
+                    break;
+                }
+            }
+            Platform::Semaphore_Wait(band->Sema_ScanlineCount);
+            buffer = band->ColorBuffer;
+        }
     }
 
-    u32* rawline = &ColorBuffer[(line * ScanlineWidth) + FirstPixelOffset];
+    u32* rawline = &buffer[(line * ScanlineWidth) + FirstPixelOffset];
     if (xpos == 0)
         return rawline;
 

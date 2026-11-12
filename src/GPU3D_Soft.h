@@ -20,9 +20,11 @@
 
 #include "GPU.h"
 #include "GPU3D.h"
+#include "GPU3D_ActivePolygons.h"
 #include "Platform.h"
 #include <thread>
 #include <atomic>
+#include <memory>
 
 namespace melonDS
 {
@@ -53,7 +55,24 @@ public:
     void EnableRenderThread();
     void StopRenderThread();
 
+    // Threaded frames without shadow polygons are rasterized as two or three contiguous
+    // horizontal bands: the render thread draws the top band and each helper thread draws
+    // one lower band into a private SoftRenderer3D. MONOMELON_3D_WORKERS (2 or 3) selects
+    // the band count and MONOMELON_3D_BANDS=0 disables banding. For validation,
+    // MONOMELON_3D_BAND_SPLIT (1..191) overrides the two-band split row and
+    // MONOMELON_3D_BAND_SPLITS ("a,b", 1 <= a < b <= 191) the three-band split rows.
+    static constexpr int MaxBandHelpers = 2;
+    static constexpr int DefaultBandWorkers = 3;
+    static constexpr int DefaultBandSplit = 96;
+    static constexpr int DefaultBandSplit3A = 96;
+    static constexpr int DefaultBandSplit3B = 160;
+
 private:
+    struct HelperTag {};
+    SoftRenderer3D(melonDS::GPU3D& gpu3D, SoftRenderer& parent, HelperTag) noexcept;
+
+    friend struct SoftRenderer3DTestAccess;
+
     SoftRenderer& Parent;
 
     friend void GPU3D::DoSavestate(Savestate* file) noexcept;
@@ -450,21 +469,36 @@ private:
     };
 
     RendererPolygon PolygonList[2048];
+    ActivePolygonRows ActiveRows;
     void TextureLookup(u32 texparam, u32 texpal, s16 s, s16 t, u16* color, u8* alpha) const;
     u32 RenderPixel(const Polygon* polygon, u8 vr, u8 vg, u8 vb, s16 s, s16 t) const;
     void PlotTranslucentPixel(u32 pixeladdr, u32 color, u32 z, u32 polyattr, u32 shadow);
     void SetupPolygonLeftEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygonRightEdge(RendererPolygon* rp, s32 y) const;
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
+    void SetupPolygon(RendererPolygon* rp, Polygon* polygon, s32 ystart) const;
     void RenderShadowMaskScanline(RendererPolygon* rp, s32 y);
     void RenderPolygonScanline(RendererPolygon* rp, s32 y);
-    void RenderScanline(s32 y, int npolys);
+    void RenderScanline(s32 y);
     u32 CalculateFogDensity(u32 pixeladdr) const;
     void ScanlineFinalPass(s32 y);
-    void ClearBuffers();
+    void ClearBuffers(int ystart = 0, int yend = 192);
     void RenderPolygons(bool threaded, Polygon** polygons, int npolys);
 
+    // Rasterizes rows [rasterStart, rasterEnd) and runs the final pass on rows
+    // [finalStart, finalEnd), posting Sema_ScanlineCount once per finished final row.
+    void RenderBand(Polygon** polygons, int npolys, s32 rasterStart, s32 rasterEnd, s32 finalStart, s32 finalEnd);
+    void RenderBandedFrame();
+    void RenderHelperBand();
+    bool CanBandFrame() const;
+    void PublishFrameMode();
+    void WaitPendingFrame();
+    void SetHelperCount(int count);
+    void StartHelper(int index);
+    void StopHelper(int index);
+
     void RenderThreadFunc();
+    void HelperThreadFunc(int index);
 
     // buffer dimensions are 258x194 to add a offscreen 1px border
     // which simplifies edge marking tests
@@ -495,7 +529,7 @@ private:
 
     bool Enabled;
 
-    bool FrameIdentical;
+    bool FrameIdentical = false;
 
     u32 ScrolledLine[256];
 
@@ -515,5 +549,34 @@ private:
     // Used to allow the main thread to read some scanlines
     // before (the 3D portion of) the entire frame is rasterized.
     Platform::Semaphore* Sema_ScanlineCount;
+
+    // Set by the emulation thread before every Sema_RenderStart post that starts a frame,
+    // cleared once it has consumed the matching Sema_RenderDone. Only that thread touches it.
+    bool FramePending = false;
+
+    // Band configuration, read once from the environment.
+    bool BandsEnabled = true;
+    int BandWorkers = DefaultBandWorkers;
+    int BandSplit = DefaultBandSplit;
+    s32 BandSplits3[MaxBandHelpers] = {DefaultBandSplit3A, DefaultBandSplit3B};
+
+    // Mode of the frame started by the last Sema_RenderStart post. Written by the emulation
+    // thread while no frame is pending and the 2D consumer is idle; GetLine reads it.
+    // FrameHelpers is 0 for a single-band frame. Helper k draws the final rows
+    // [FrameStart[k], FrameStart[k + 1]), the last helper through row 191.
+    int FrameHelpers = 0;
+    s32 FrameStart[MaxBandHelpers] = {};
+
+    // Band of a helper context for the current frame: final rows [FrameSplit, FrameEnd),
+    // plus FrameHalo edge marking rows on each side that exist.
+    s32 FrameSplit = 0;
+    s32 FrameEnd = 192;
+    s32 FrameHalo = 0;
+
+    // Lower band contexts. Their buffers, polygon lists and semaphores are private to their
+    // helper threads during a frame; the render thread seeds and joins them.
+    std::unique_ptr<SoftRenderer3D> Helpers[MaxBandHelpers];
+    Platform::Thread* HelperThreads[MaxBandHelpers] = {};
+    std::atomic_bool HelperRunning[MaxBandHelpers] = {};
 };
 }
