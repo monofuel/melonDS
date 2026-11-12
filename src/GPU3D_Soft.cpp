@@ -1806,7 +1806,12 @@ void SoftRenderer3D::RenderThreadFunc()
 
 u32* SoftRenderer3D::GetLine(int line)
 {
-    if (GPU3D.AbortFrame)
+    return GetLine(line, GPU3D.RenderXPos, GPU3D.AbortFrame);
+}
+
+u32* SoftRenderer3D::GetLine(int line, u16 xpos, bool abortFrame)
+{
+    if (abortFrame)
     {
         // TODO this isn't accurate
         memset(ScrolledLine, 0, sizeof(ScrolledLine));
@@ -1823,7 +1828,6 @@ u32* SoftRenderer3D::GetLine(int line)
     }
 
     u32* rawline = &ColorBuffer[(line * ScanlineWidth) + FirstPixelOffset];
-    u16 xpos = GPU3D.RenderXPos;
     if (xpos == 0)
         return rawline;
 

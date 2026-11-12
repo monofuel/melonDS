@@ -48,6 +48,30 @@ void SoftRenderer2D::Reset()
     SpritePriorities = 0;
 }
 
+void SoftRenderer2D::CaptureState(const melonDS::GPU2D& src, Soft2DState& dst)
+{
+#define SOFT2D_CAPTURE(field) \
+    static_assert(sizeof(dst.field) == sizeof(src.field)); \
+    memcpy(&dst.field, &src.field, sizeof(dst.field));
+    SOFT2D_STATE_FIELDS(SOFT2D_CAPTURE)
+#undef SOFT2D_CAPTURE
+}
+
+void SoftRenderer2D::ApplyState(const Soft2DState& src, melonDS::GPU2D& dst)
+{
+    const u8 win0Carry = dst.Win0Active & 0x2;
+    const u8 win1Carry = dst.Win1Active & 0x2;
+
+#define SOFT2D_APPLY(field) \
+    static_assert(sizeof(dst.field) == sizeof(src.field)); \
+    memcpy(&dst.field, &src.field, sizeof(dst.field));
+    SOFT2D_STATE_FIELDS(SOFT2D_APPLY)
+#undef SOFT2D_APPLY
+
+    dst.Win0Active = (src.Win0Active & 0x1) | win0Carry;
+    dst.Win1Active = (src.Win1Active & 0x1) | win1Carry;
+}
+
 u32 SoftRenderer2D::ColorComposite(int i, u32 val1, u32 val2) const
 {
     u32 coloreffect = 0;
@@ -144,24 +168,8 @@ void SoftRenderer2D::DrawScanline(u32 line)
         return;
     }
 
-    if (GPU2D.Num == 0)
-    {
-        auto bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
-        GPU.MakeVRAMFlat_ABGCoherent(bgDirty);
-        auto bgExtPalDirty = GPU.VRAMDirty_ABGExtPal.DeriveState(GPU.VRAMMap_ABGExtPal, GPU);
-        GPU.MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirty);
-        auto objExtPalDirty = GPU.VRAMDirty_AOBJExtPal.DeriveState(&GPU.VRAMMap_AOBJExtPal, GPU);
-        GPU.MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirty);
-    }
-    else
-    {
-        auto bgDirty = GPU.VRAMDirty_BBG.DeriveState(GPU.VRAMMap_BBG, GPU);
-        GPU.MakeVRAMFlat_BBGCoherent(bgDirty);
-        auto bgExtPalDirty = GPU.VRAMDirty_BBGExtPal.DeriveState(GPU.VRAMMap_BBGExtPal, GPU);
-        GPU.MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirty);
-        auto objExtPalDirty = GPU.VRAMDirty_BOBJExtPal.DeriveState(&GPU.VRAMMap_BOBJExtPal, GPU);
-        GPU.MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirty);
-    }
+    // The BG and extended palette VRAM caches are made coherent by SoftRenderer
+    // before this line is captured.
 
     // render BG layers and sprites
     DrawScanline_BGOBJ(line, dst);
@@ -313,9 +321,9 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 {
     u64 backdrop;
     if (GPU2D.Num)
-        backdrop = *(u16*)&GPU.Palette[0x400];
+        backdrop = *(u16*)&Palette[0x400];
     else
-        backdrop = *(u16*)&GPU.Palette[0];
+        backdrop = *(u16*)&Palette[0];
 
     {
         u8 r = (backdrop & 0x001F) << 1;
@@ -444,14 +452,14 @@ void SoftRenderer2D::DrawBG_Text(u32 line, u32 bgnum)
         tilesetaddr = ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0x400];
+        pal = (u16*)&Palette[0x400];
     }
     else
     {
         tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0];
+        pal = (u16*)&Palette[0];
     }
 
     // adjust Y position in tilemap
@@ -652,14 +660,14 @@ void SoftRenderer2D::DrawBG_Affine(u32 line, u32 bgnum)
         tilesetaddr = ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0x400];
+        pal = (u16*)&Palette[0x400];
     }
     else
     {
         tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
         tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-        pal = (u16*)&GPU.Palette[0];
+        pal = (u16*)&Palette[0];
     }
 
     u16 curtile;
@@ -793,8 +801,8 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
         {
             // 256-color bitmap
 
-            if (GPU2D.Num) pal = (u16*)&GPU.Palette[0x400];
-            else           pal = (u16*)&GPU.Palette[0];
+            if (GPU2D.Num) pal = (u16*)&Palette[0x400];
+            else           pal = (u16*)&Palette[0];
 
             u8 color;
 
@@ -852,14 +860,14 @@ void SoftRenderer2D::DrawBG_Extended(u32 line, u32 bgnum)
             tilesetaddr = ((bgcnt & 0x003C) << 12);
             tilemapaddr = ((bgcnt & 0x1F00) << 3);
 
-            pal = (u16*)&GPU.Palette[0x400];
+            pal = (u16*)&Palette[0x400];
         }
         else
         {
             tilesetaddr = ((GPU2D.DispCnt & 0x07000000) >> 8) + ((bgcnt & 0x003C) << 12);
             tilemapaddr = ((GPU2D.DispCnt & 0x38000000) >> 11) + ((bgcnt & 0x1F00) << 3);
 
-            pal = (u16*)&GPU.Palette[0];
+            pal = (u16*)&Palette[0];
         }
 
         u16 curtile;
@@ -958,8 +966,8 @@ void SoftRenderer2D::DrawBG_Large(u32 line) // BG is always BG2
 
     // 256-color bitmap
 
-    if (GPU2D.Num) pal = (u16*)&GPU.Palette[0x400];
-    else           pal = (u16*)&GPU.Palette[0];
+    if (GPU2D.Num) pal = (u16*)&Palette[0x400];
+    else           pal = (u16*)&Palette[0];
 
     u8 color;
 
@@ -1047,7 +1055,7 @@ void SoftRenderer2D::InterleaveSprites(u32 prio)
         return;
 
     u32 attrmask = (prio << 16) | OBJ_IsOpaque;
-    u16* pal = (u16*)&GPU.Palette[GPU2D.Num ? 0x600 : 0x200];
+    u16* pal = (u16*)&Palette[GPU2D.Num ? 0x600 : 0x200];
     u16* extpal = GPU2D.GetOBJExtPal();
 
     for (u32 i = 0; i < 256; i++)
@@ -1090,16 +1098,7 @@ void SoftRenderer2D::DrawSprites(u32 line)
     if (!GPU2D.Enabled)
         return;
 
-    if (GPU2D.Num == 0)
-    {
-        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
-        GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
-    }
-    else
-    {
-        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
-        GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
-    }
+    // The OBJ VRAM cache is made coherent by SoftRenderer before this line is captured.
 
     NumSprites = 0;
     SpritePriorities = 0;
@@ -1109,7 +1108,7 @@ void SoftRenderer2D::DrawSprites(u32 line)
     if (!GPU2D.OBJEnable)
         return;
 
-    u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+    u16* oam = (u16*)&OAM[GPU2D.Num ? 0x400 : 0];
 
     const s32 spritewidth[16] =
     {
@@ -1210,7 +1209,7 @@ void SoftRenderer2D::DrawSpritePixel(int color, u32 pixelattr, s32 xpos)
 template<bool window>
 void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheight, u32 width, u32 height, s32 xpos, s32 ypos)
 {
-    u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+    u16* oam = (u16*)&OAM[GPU2D.Num ? 0x400 : 0];
     u16* attrib = &oam[num * 4];
     u16* rotparams = &oam[(((attrib[1] >> 9) & 0x1F) * 16) + 3];
 
@@ -1392,7 +1391,7 @@ void SoftRenderer2D::DrawSprite_Rotscale(u32 num, u32 boundwidth, u32 boundheigh
 template<bool window>
 void SoftRenderer2D::DrawSprite_Normal(u32 num, u32 width, u32 height, s32 xpos, s32 ypos)
 {
-    u16* oam = (u16*)&GPU.OAM[GPU2D.Num ? 0x400 : 0];
+    u16* oam = (u16*)&OAM[GPU2D.Num ? 0x400 : 0];
     u16* attrib = &oam[num * 4];
 
     u32 pixelattr = ((attrib[2] & 0x0C00) << 6) | OBJ_IsSprite | OBJ_IsOpaque;

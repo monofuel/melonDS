@@ -44,6 +44,11 @@ public:
 
     u32* GetLine(int line) override;
 
+    // GetLine with the X scroll and abort flag supplied by the caller instead of read from
+    // GPU3D. Whichever thread calls it owns ScrolledLine and consumes Sema_ScanlineCount,
+    // so calls must stay in scanline order and never overlap.
+    u32* GetLine(int line, u16 xpos, bool abortFrame);
+
     void SetupRenderThread();
     void EnableRenderThread();
     void StopRenderThread();

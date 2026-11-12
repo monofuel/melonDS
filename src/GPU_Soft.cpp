@@ -16,6 +16,9 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
+
+#include <stdlib.h>
+
 #include "NDS.h"
 #include "GPU_Soft.h"
 #include "GPU_ColorOp.h"
@@ -23,8 +26,40 @@
 namespace melonDS
 {
 
+// Coarse 2D batching.
+//
+// The emulation thread still runs every register latch and every VRAM cache check at its
+// original point in the frame. What moves to a worker thread is the pixel work: for each
+// HBlank the emulation thread captures a SoftLineRecord and the worker draws it later.
+//
+// What the worker may touch: published records, the shadow GPU2D objects, the 2D
+// renderers' line buffers, Output2D/Output3D, the back framebuffer rows named by the
+// records, the VRAMFlat_* caches (read only), and the 3D renderer's finished scanlines
+// through SoftRenderer3D::GetLine. It never reads live registers, palette, OAM, raw VRAM,
+// VRAM mappings or dirty bits.
+//
+// Ownership passes to the worker when QueuePublished moves past a record and returns when
+// QueueConsumed moves past it. The emulation thread waits for that (Drain/WaitIdle) before
+// it changes anything on the list above, and before it draws a line itself.
+
+static u32 ReadBatchSize(u32 fallback, u32 max)
+{
+    // Private validation control: 0 draws every line on the emulation thread,
+    // 1..max sets how many lines are handed over per wake of the worker.
+    const char* text = getenv("MONOMELON_BATCH2D");
+    if (!text || !*text)
+        return fallback;
+
+    char* end = nullptr;
+    unsigned long value = strtoul(text, &end, 10);
+    if (*end || value > max)
+        return fallback;
+
+    return (u32)value;
+}
+
 SoftRenderer::SoftRenderer(melonDS::NDS& nds)
-    : Renderer(nds.GPU)
+    : Renderer(nds.GPU), Shadow2D_A(0, nds.GPU), Shadow2D_B(1, nds.GPU)
 {
     const size_t len = 256 * 192;
     Framebuffer[0][0] = new u32[len];
@@ -33,13 +68,32 @@ SoftRenderer::SoftRenderer(melonDS::NDS& nds)
     Framebuffer[1][1] = new u32[len];
     BackBuffer = 0;
 
-    Rend2D_A = std::make_unique<SoftRenderer2D>(GPU.GPU2D_A, *this);
-    Rend2D_B = std::make_unique<SoftRenderer2D>(GPU.GPU2D_B, *this);
-    Rend3D = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+    Shadow2D_A.Reset();
+    Shadow2D_B.Reset();
+
+    auto rend2dA = std::make_unique<SoftRenderer2D>(Shadow2D_A, *this);
+    auto rend2dB = std::make_unique<SoftRenderer2D>(Shadow2D_B, *this);
+    auto rend3d = std::make_unique<SoftRenderer3D>(GPU.GPU3D, *this);
+    Soft2D[0] = rend2dA.get();
+    Soft2D[1] = rend2dB.get();
+    Soft3D = rend3d.get();
+    Rend2D_A = std::move(rend2dA);
+    Rend2D_B = std::move(rend2dB);
+    Rend3D = std::move(rend3d);
+
+    Sema_Work = Platform::Semaphore_Create();
+    Sema_Fence = Platform::Semaphore_Create();
+    BatchSize = ReadBatchSize(DefaultBatchSize, MaxBatchSize);
 }
 
 SoftRenderer::~SoftRenderer()
 {
+    StopWorker();
+    MergeWindowCarry();
+
+    Platform::Semaphore_Free(Sema_Work);
+    Platform::Semaphore_Free(Sema_Fence);
+
     delete[] Framebuffer[0][0];
     delete[] Framebuffer[0][1];
     delete[] Framebuffer[1][0];
@@ -48,6 +102,10 @@ SoftRenderer::~SoftRenderer()
 
 void SoftRenderer::Reset()
 {
+    // GPU::Reset clears the live 2D state before it gets here. Queued lines are finished,
+    // but their window carry is dropped in favor of the freshly reset live value.
+    WaitIdle();
+
     const size_t len = 256 * 192 * sizeof(u32);
     memset(Framebuffer[0][0], 0, len);
     memset(Framebuffer[0][1], 0, len);
@@ -57,10 +115,15 @@ void SoftRenderer::Reset()
     Rend2D_A->Reset();
     Rend2D_B->Reset();
     Rend3D->Reset();
+
+    ReloadWindowCarry();
+    DirtyWaitsThisFrame = 0;
 }
 
 void SoftRenderer::Stop()
 {
+    Drain();
+
     // clear framebuffers to black
     const size_t len = 256 * 192 * sizeof(u32);
     memset(Framebuffer[0][0], 0, len);
@@ -72,58 +135,412 @@ void SoftRenderer::Stop()
 
 void SoftRenderer::PreSavestate()
 {
-    auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
-    if (rend3d->IsThreaded())
-        rend3d->SetupRenderThread();
+    // The savestate must see the window carry of every line emulated so far, and
+    // SetupRenderThread resets the scanline semaphore the queued lines consume.
+    Drain();
+
+    if (Soft3D->IsThreaded())
+        Soft3D->SetupRenderThread();
 }
 
 void SoftRenderer::PostSavestate()
 {
-    auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
-    if (rend3d->IsThreaded())
-        rend3d->EnableRenderThread();
+    if (Soft3D->IsThreaded())
+        Soft3D->EnableRenderThread();
+
+    ReloadWindowCarry();
 }
 
 
 void SoftRenderer::SetRenderSettings(RendererSettings& settings)
 {
-    auto rend3d = dynamic_cast<SoftRenderer3D*>(Rend3D.get());
-    rend3d->SetThreaded(settings.Threaded);
+    Drain();
+
+    Soft3D->SetThreaded(settings.Threaded);
+
+    if (settings.Threaded && BatchSize)
+        StartWorker();
+    else
+        StopWorker();
 }
 
 
-void SoftRenderer::DrawScanline(u32 line)
+void SoftRenderer::StartWorker()
 {
-    u32 *dstA, *dstB;
+    if (Worker)
+        return;
+
+    // A stopped worker may have left tokens for publishes it had already drawn.
+    Platform::Semaphore_Reset(Sema_Work);
+    Worker = Platform::Thread_Create([this]() {
+        WorkerFunc();
+    });
+}
+
+void SoftRenderer::StopWorker()
+{
+    if (!Worker)
+        return;
+
+    WaitIdle();
+
+    Ring[QueueWrite & RingMask].Kind = SoftLineRecord::Kind_Stop;
+    QueueWrite++;
+    PublishRecords();
+
+    Platform::Thread_Wait(Worker);
+    Platform::Thread_Free(Worker);
+    Worker = nullptr;
+}
+
+void SoftRenderer::WorkerFunc()
+{
+    u32 pos = QueueConsumed.load(std::memory_order_relaxed);
+
+    for (;;)
+    {
+        Platform::Semaphore_Wait(Sema_Work);
+
+        // Every publish posts Sema_Work after it stores QueuePublished, so a record that
+        // becomes visible after the last load below always has a token left to wake us.
+        u32 end = QueuePublished.load(std::memory_order_acquire);
+        while (pos != end)
+        {
+            SoftLineRecord& rec = Ring[pos & RingMask];
+            pos++;
+
+            if (rec.Kind == SoftLineRecord::Kind_Line)
+            {
+                RenderRecord(rec);
+                QueueConsumed.store(pos, std::memory_order_release);
+            }
+            else if (rec.Kind == SoftLineRecord::Kind_Fence)
+            {
+                QueueConsumed.store(pos, std::memory_order_release);
+                Platform::Semaphore_Post(Sema_Fence);
+            }
+            else
+            {
+                QueueConsumed.store(pos, std::memory_order_release);
+                return;
+            }
+
+            if (pos == end)
+                end = QueuePublished.load(std::memory_order_acquire);
+        }
+    }
+}
+
+bool SoftRenderer::QueueBusy() const
+{
+    return OpenRecord || QueueConsumed.load(std::memory_order_acquire) != QueueWrite;
+}
+
+SoftLineRecord& SoftRenderer::AcquireRecord()
+{
+    // A slot is reused only after the worker has moved past it.
+    if (QueueWrite - QueueConsumed.load(std::memory_order_acquire) >= RingSize - 1)
+    {
+        Stats.FullWaits++;
+        WaitIdle();
+    }
+
+    return Ring[QueueWrite & RingMask];
+}
+
+void SoftRenderer::CommitRecord(bool publish)
+{
+    OpenRecord = nullptr;
+    QueueWrite++;
+    Stats.QueuedLines++;
+
+    if (publish || (QueueWrite - QueuePublishedLocal) >= BatchSize)
+        PublishRecords();
+}
+
+void SoftRenderer::PublishRecords()
+{
+    if (QueuePublishedLocal == QueueWrite)
+        return;
+
+    QueuePublishedLocal = QueueWrite;
+    QueuePublished.store(QueueWrite, std::memory_order_release);
+    Platform::Semaphore_Post(Sema_Work);
+    Stats.Publishes++;
+}
+
+void SoftRenderer::WaitIdle()
+{
+    if (OpenRecord)
+        CommitRecord(false);
+
+    if (!Worker)
+        return;
+
+    if (QueueConsumed.load(std::memory_order_acquire) == QueueWrite)
+        return;
+
+    Ring[QueueWrite & RingMask].Kind = SoftLineRecord::Kind_Fence;
+    QueueWrite++;
+    PublishRecords();
+    Platform::Semaphore_Wait(Sema_Fence);
+    Stats.Fences++;
+}
+
+void SoftRenderer::Drain()
+{
+    WaitIdle();
+    MergeWindowCarry();
+}
+
+void SoftRenderer::MergeWindowCarry()
+{
+    // Bit 0 is maintained live by GPU2D::UpdateWindows. Bit 1 is whatever the last drawn
+    // line left behind, which is what GPU2D::DoSavestate has to store.
+    GPU.GPU2D_A.Win0Active = (GPU.GPU2D_A.Win0Active & ~0x2) | (Shadow2D_A.Win0Active & 0x2);
+    GPU.GPU2D_A.Win1Active = (GPU.GPU2D_A.Win1Active & ~0x2) | (Shadow2D_A.Win1Active & 0x2);
+    GPU.GPU2D_B.Win0Active = (GPU.GPU2D_B.Win0Active & ~0x2) | (Shadow2D_B.Win0Active & 0x2);
+    GPU.GPU2D_B.Win1Active = (GPU.GPU2D_B.Win1Active & ~0x2) | (Shadow2D_B.Win1Active & 0x2);
+}
+
+void SoftRenderer::ReloadWindowCarry()
+{
+    Shadow2D_A.Win0Active = GPU.GPU2D_A.Win0Active & 0x2;
+    Shadow2D_A.Win1Active = GPU.GPU2D_A.Win1Active & 0x2;
+    Shadow2D_B.Win0Active = GPU.GPU2D_B.Win0Active & 0x2;
+    Shadow2D_B.Win1Active = GPU.GPU2D_B.Win1Active & 0x2;
+}
+
+void SoftRenderer::NoteDirtyWait()
+{
+    if (!QueueBusy())
+        return;
+
+    Stats.DirtyWaits++;
+    DirtyWaitsThisFrame++;
+}
+
+void SoftRenderer::SyncBGCaches()
+{
+    // Same sets, order and conditions as the 2D renderers applied in their own
+    // DrawScanline. A cache is only rewritten after every queued line has been drawn,
+    // because those lines must see the cache as it was when they were captured.
+    if (GPU.GPU2D_A.Enabled && !GPU.GPU2D_A.ForcedBlank)
+    {
+        auto bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
+        auto bgExtPalDirty = GPU.VRAMDirty_ABGExtPal.DeriveState(GPU.VRAMMap_ABGExtPal, GPU);
+        auto objExtPalDirty = GPU.VRAMDirty_AOBJExtPal.DeriveState(&GPU.VRAMMap_AOBJExtPal, GPU);
+        if (bgDirty || bgExtPalDirty || objExtPalDirty)
+        {
+            NoteDirtyWait();
+            Drain();
+            GPU.MakeVRAMFlat_ABGCoherent(bgDirty);
+            GPU.MakeVRAMFlat_ABGExtPalCoherent(bgExtPalDirty);
+            GPU.MakeVRAMFlat_AOBJExtPalCoherent(objExtPalDirty);
+        }
+    }
+
+    if (GPU.GPU2D_B.Enabled && !GPU.GPU2D_B.ForcedBlank)
+    {
+        auto bgDirty = GPU.VRAMDirty_BBG.DeriveState(GPU.VRAMMap_BBG, GPU);
+        auto bgExtPalDirty = GPU.VRAMDirty_BBGExtPal.DeriveState(GPU.VRAMMap_BBGExtPal, GPU);
+        auto objExtPalDirty = GPU.VRAMDirty_BOBJExtPal.DeriveState(&GPU.VRAMMap_BOBJExtPal, GPU);
+        if (bgDirty || bgExtPalDirty || objExtPalDirty)
+        {
+            NoteDirtyWait();
+            Drain();
+            GPU.MakeVRAMFlat_BBGCoherent(bgDirty);
+            GPU.MakeVRAMFlat_BBGExtPalCoherent(bgExtPalDirty);
+            GPU.MakeVRAMFlat_BOBJExtPalCoherent(objExtPalDirty);
+        }
+    }
+}
+
+void SoftRenderer::SyncOBJCaches()
+{
+    if (GPU.GPU2D_A.Enabled)
+    {
+        auto objDirty = GPU.VRAMDirty_AOBJ.DeriveState(GPU.VRAMMap_AOBJ, GPU);
+        if (objDirty)
+        {
+            NoteDirtyWait();
+            Drain();
+            GPU.MakeVRAMFlat_AOBJCoherent(objDirty);
+        }
+    }
+
+    if (GPU.GPU2D_B.Enabled)
+    {
+        auto objDirty = GPU.VRAMDirty_BOBJ.DeriveState(GPU.VRAMMap_BOBJ, GPU);
+        if (objDirty)
+        {
+            NoteDirtyWait();
+            Drain();
+            GPU.MakeVRAMFlat_BOBJCoherent(objDirty);
+        }
+    }
+}
+
+void SoftRenderer::CaptureLine(SoftLineRecord& rec, u32 line)
+{
+    rec.Kind = SoftLineRecord::Kind_Line;
+    rec.HasScanline = true;
+    rec.HasSprites = false;
+    rec.ScreensEnabled = GPU.ScreensEnabled;
+    rec.AbortFrame = GPU.GPU3D.AbortFrame;
+    rec.CaptureEnable = GPU.CaptureEnable;
+
+    // the position used for drawing operations is based on VCOUNT
+    rec.VCount = GPU.VCount;
+    rec.RenderXPos = GPU.GPU3D.RenderXPos;
+    rec.MasterBrightnessA = GPU.MasterBrightnessA;
+    rec.MasterBrightnessB = GPU.MasterBrightnessB;
+    rec.SpriteLine = 0;
+
     u32 dstoffset = 256 * line;
     if (GPU.ScreenSwap)
     {
-        dstA = &Framebuffer[BackBuffer][0][dstoffset];
-        dstB = &Framebuffer[BackBuffer][1][dstoffset];
+        rec.DstA = &Framebuffer[BackBuffer][0][dstoffset];
+        rec.DstB = &Framebuffer[BackBuffer][1][dstoffset];
     }
     else
     {
-        dstA = &Framebuffer[BackBuffer][1][dstoffset];
-        dstB = &Framebuffer[BackBuffer][0][dstoffset];
+        rec.DstA = &Framebuffer[BackBuffer][1][dstoffset];
+        rec.DstB = &Framebuffer[BackBuffer][0][dstoffset];
     }
 
-    // the position used for drawing operations is based on VCOUNT
-    line = GPU.VCount;
+    SoftRenderer2D::CaptureState(GPU.GPU2D_A, rec.Engine[0]);
+    SoftRenderer2D::CaptureState(GPU.GPU2D_B, rec.Engine[1]);
+    memcpy(rec.Palette, GPU.Palette, sizeof(rec.Palette));
+}
+
+void SoftRenderer::CaptureSprites(SoftLineRecord& rec, u32 line)
+{
+    rec.HasSprites = true;
+    rec.SpriteLine = line;
+    memcpy(rec.OAM, GPU.OAM, sizeof(rec.OAM));
+}
+
+void SoftRenderer::RenderRecord(SoftLineRecord& rec)
+{
+    SoftRenderer2D::ApplyState(rec.Engine[0], Shadow2D_A);
+    SoftRenderer2D::ApplyState(rec.Engine[1], Shadow2D_B);
+    Soft2D[0]->SetLineMemory(rec.Palette, rec.OAM);
+    Soft2D[1]->SetLineMemory(rec.Palette, rec.OAM);
+
+    if (rec.HasScanline)
+        RenderScanline(rec);
+
+    if (rec.HasSprites)
+    {
+        Soft2D[0]->DrawSprites(rec.SpriteLine);
+        Soft2D[1]->DrawSprites(rec.SpriteLine);
+    }
+}
+
+void SoftRenderer::DrawScanline(u32 line)
+{
+    // GPU::StartHBlank calls DrawSprites right after DrawScanline for lines 0..190, so a
+    // record left open here means that call never came.
+    if (OpenRecord)
+        CommitRecord(false);
+
+    const bool visible = GPU.VCount < 192;
+    if (visible)
+        SyncBGCaches();
+
+    // Display capture and the VRAM and FIFO display modes read or write live memory at
+    // this exact point of the frame, so such a line is drawn right here.
+    const bool needsLiveMemory = visible &&
+        (GPU.CaptureEnable || ((GPU.GPU2D_A.DispCnt >> 16) & 0x3) >= 2);
+
+    if (!Worker || needsLiveMemory || DirtyWaitsThisFrame > MaxDirtyWaitsPerFrame)
+    {
+        Drain();
+        CaptureLine(InlineRecord, line);
+        RenderRecord(InlineRecord);
+        MergeWindowCarry();
+        Stats.InlineLines++;
+        return;
+    }
+
+    SoftLineRecord& rec = AcquireRecord();
+    CaptureLine(rec, line);
+    OpenRecord = &rec;
+
+    // Line 191 gets no DrawSprites call. It also ends the visible frame, so whatever is
+    // still batched goes out now instead of waiting for the next drain.
+    if (line >= 191)
+        CommitRecord(true);
+}
+
+void SoftRenderer::DrawSprites(u32 line)
+{
+    // This may drain, which commits an open record without sprites.
+    SyncOBJCaches();
+
+    if (OpenRecord)
+    {
+        // Same HBlank as the open record's scanline: nothing has run in between, so its
+        // captured register state is also the state these sprites are drawn with.
+        CaptureSprites(*OpenRecord, line);
+        CommitRecord(false);
+        return;
+    }
+
+    Drain();
+
+    InlineRecord.Kind = SoftLineRecord::Kind_Line;
+    InlineRecord.HasScanline = false;
+    SoftRenderer2D::CaptureState(GPU.GPU2D_A, InlineRecord.Engine[0]);
+    SoftRenderer2D::CaptureState(GPU.GPU2D_B, InlineRecord.Engine[1]);
+    CaptureSprites(InlineRecord, line);
+    RenderRecord(InlineRecord);
+    Stats.InlineSprites++;
+}
+
+void SoftRenderer::Start3DRendering()
+{
+    // The 3D renderer is about to overwrite the scanlines queued lines still read.
+    Drain();
+    Renderer::Start3DRendering();
+}
+
+void SoftRenderer::Restart3DRendering()
+{
+    // RestartFrame resets the scanline semaphore queued lines consume.
+    Drain();
+    Renderer::Restart3DRendering();
+}
+
+void SoftRenderer::SwapBuffers()
+{
+    Drain();
+    Renderer::SwapBuffers();
+    DirtyWaitsThisFrame = 0;
+}
+
+void SoftRenderer::RenderScanline(const SoftLineRecord& rec)
+{
+    u32* dstA = rec.DstA;
+    u32* dstB = rec.DstB;
+
+    u32 line = rec.VCount;
     if (line < 192)
     {
         // retrieve 3D output
-        Output3D = Rend3D->GetLine(line);
+        Output3D = Soft3D->GetLine(line, rec.RenderXPos, rec.AbortFrame);
 
         // draw BG/OBJ layers
-        Rend2D_A->DrawScanline(line);
-        Rend2D_B->DrawScanline(line);
+        Soft2D[0]->DrawScanline(line);
+        Soft2D[1]->DrawScanline(line);
 
         // draw the final screen output
-        DrawScanlineA(line, dstA);
-        DrawScanlineB(line, dstB);
+        DrawScanlineA(line, dstA, rec.MasterBrightnessA);
+        DrawScanlineB(line, dstB, rec.MasterBrightnessB);
 
         // perform display capture if enabled
-        if (GPU.CaptureEnable)
+        if (rec.CaptureEnable)
             DoCapture(line);
     }
     else
@@ -140,7 +557,7 @@ void SoftRenderer::DrawScanline(u32 line)
         }
     }
 
-    if (GPU.ScreensEnabled)
+    if (rec.ScreensEnabled)
     {
         // expand the color from 6-bit to 8-bit
         ExpandColor(dstA);
@@ -157,15 +574,9 @@ void SoftRenderer::DrawScanline(u32 line)
     }
 }
 
-void SoftRenderer::DrawSprites(u32 line)
+void SoftRenderer::DrawScanlineA(u32 line, u32* dst, u16 masterBrightness)
 {
-    Rend2D_A->DrawSprites(line);
-    Rend2D_B->DrawSprites(line);
-}
-
-void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
-{
-    u32 dispcnt = GPU.GPU2D_A.DispCnt;
+    u32 dispcnt = Shadow2D_A.DispCnt;
     switch ((dispcnt >> 16) & 0x3)
     {
     case 0: // screen off
@@ -182,6 +593,8 @@ void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
         }
         break;
 
+    // The two modes below read live memory. DrawScanline never queues such a line, so
+    // they only ever run on the emulation thread.
     case 2: // VRAM display
         {
             u32 vrambank = (dispcnt >> 18) & 0x3;
@@ -223,12 +636,12 @@ void SoftRenderer::DrawScanlineA(u32 line, u32* dst)
         break;
     }
 
-    ApplyMasterBrightness(GPU.MasterBrightnessA, dst);
+    ApplyMasterBrightness(masterBrightness, dst);
 }
 
-void SoftRenderer::DrawScanlineB(u32 line, u32* dst)
+void SoftRenderer::DrawScanlineB(u32 line, u32* dst, u16 masterBrightness)
 {
-    u32 dispcnt = GPU.GPU2D_B.DispCnt;
+    u32 dispcnt = Shadow2D_B.DispCnt;
     switch ((dispcnt >> 16) & 0x1)
     {
     case 0: // screen off
@@ -246,7 +659,7 @@ void SoftRenderer::DrawScanlineB(u32 line, u32* dst)
         break;
     }
 
-    ApplyMasterBrightness(GPU.MasterBrightnessB, dst);
+    ApplyMasterBrightness(masterBrightness, dst);
 }
 
 void SoftRenderer::DoCapture(u32 line)

@@ -24,6 +24,27 @@ namespace melonDS
 {
 class SoftRenderer;
 
+// Every data member of GPU2D except Num and the GPU reference.
+// The list drives the snapshot type, capture and apply, so they cannot drift apart.
+#define SOFT2D_STATE_FIELDS(X) \
+    X(Enabled) \
+    X(DispCnt) X(DispCntLatch) X(LayerEnable) X(OBJEnable) X(ForcedBlank) \
+    X(BGCnt) X(BGXPos) X(BGYPos) \
+    X(BGXRef) X(BGYRef) X(BGXRefInternal) X(BGYRefInternal) X(BGXRefReload) X(BGYRefReload) \
+    X(BGRotA) X(BGRotB) X(BGRotC) X(BGRotD) \
+    X(Win0Coords) X(Win1Coords) X(WinCnt) X(Win0Active) X(Win1Active) \
+    X(BGMosaicSize) X(OBJMosaicSize) X(BGMosaicY) X(BGMosaicYMax) X(OBJMosaicY) \
+    X(BGMosaicLatch) X(OBJMosaicLatch) X(BGMosaicLine) X(OBJMosaicLine) \
+    X(BlendCnt) X(BlendAlpha) X(EVA) X(EVB) X(EVY)
+
+// Plain copy of one 2D engine's register state as it stands after UpdateRegistersPreDraw.
+struct Soft2DState
+{
+#define SOFT2D_DECLARE(field) decltype(melonDS::GPU2D::field) field;
+    SOFT2D_STATE_FIELDS(SOFT2D_DECLARE)
+#undef SOFT2D_DECLARE
+};
+
 class SoftRenderer2D : public Renderer2D
 {
 public:
@@ -37,8 +58,20 @@ public:
     void VBlank() override {}
     void VBlankEnd() override {};
 
+    static void CaptureState(const melonDS::GPU2D& src, Soft2DState& dst);
+
+    // Bit 1 of Win0Active/Win1Active belongs to CalculateWindowMask and carries from one
+    // rendered line to the next, so it is kept from dst and only bit 0 is taken from src.
+    static void ApplyState(const Soft2DState& src, melonDS::GPU2D& dst);
+
+    // The 2 KiB palette and OAM images the next DrawScanline/DrawSprites calls read.
+    void SetLineMemory(u8* palette, u8* oam) { Palette = palette; OAM = oam; }
+
 private:
     SoftRenderer& Parent;
+
+    u8* Palette = nullptr;
+    u8* OAM = nullptr;
 
     enum
     {

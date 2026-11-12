@@ -21,6 +21,39 @@ The libretro wrapper lives at https://github.com/monofuel/melonds-ds/tree/master
 Build flags, open-demo PGO training and package checks live in
 https://github.com/monofuel/mono-overlay/tree/master/games-emulation/libretro-monomelon.
 
+## Batched software 2D renderer
+
+The threaded software renderer queues register/palette/OAM snapshots in batches
+of 16 lines. Emulation keeps the original register and VRAM timing; a worker
+draws from immutable records and stable flattened VRAM. Capture and raw VRAM/FIFO
+display modes remain inline. State operations drain the queue and preserve window
+carry. Disabling threaded rendering uses the same snapshot path serially.
+
+The differential harness runs the actual renderer against pre-batching commit
+`af1e4a005e3478be1d9327f6aedb46fd0b2e9e2a`, which must exist in the clone. It
+needs a C/C++17 compiler and pthreads, with no game ROM or BIOS files:
+
+```sh
+tests/monomelon/build-batch2d.sh /tmp/melonds-batch2d-test
+/tmp/melonds-batch2d-test/harness-ref unit carry raster dirty capture lifecycle boundary --seeds 0 10 --frames 4 > /tmp/batch2d-ref.txt
+/tmp/melonds-batch2d-test/harness-cand unit carry raster dirty capture lifecycle boundary --seeds 0 10 --frames 4 --pace > /tmp/batch2d-cand.txt
+cmp /tmp/batch2d-ref.txt /tmp/batch2d-cand.txt
+```
+
+Use a fresh output directory. `JOBS` defaults to 4; `CC`, `CXX` and `AR` support
+cross compilation. `MONOMELON_BATCH2D=0` forces inline rendering; 1/8/16 select
+worker batch sizes for comparisons. `--unthreaded` also disables the 3D thread.
+The harness compares complete frame and GPU-state hashes across scripted
+window, mosaic, palette, OAM, VRAM, capture and lifecycle changes. Allocation
+poisoning and an explicit initial capture flag keep reference inputs repeatable.
+
+These tests pass on x86-64 and the RG DS Plus. Mid-frame lifecycle fixtures keep
+3D off BG0 because the reference has nondeterministic scanline-token behavior;
+they do not establish correctness for that upstream issue. Small unsuppressed
+ThreadSanitizer runs report existing main/3D races in both versions and no new
+2D-worker race in the exercised cases. Game-level video/PCM comparisons and
+performance measurements remain separate; see the overlay's performance document.
+
 The grouped color-compositing shortcut has a separate ARM64 test:
 
 ```sh
