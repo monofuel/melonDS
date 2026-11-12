@@ -2,6 +2,9 @@
 
 This is the melonDS engine used by [monoMelon](https://github.com/monofuel/mono-overlay/blob/master/docs/monomelon.md)
 through our [melonds-ds libretro fork](https://github.com/monofuel/melonds-ds).
+The [mono-overlay](https://github.com/monofuel/mono-overlay) Gentoo ebuild builds
+the core; [mono-retro](https://github.com/monofuel/mono-retro) provides the Nim
+player with paired DRM/KMS display support.
 
 **Target:** Lost in Blue at native 100% speed on the **Anbernic RG DS Plus
 (RK3568 / Cortex-A55)** through mono-retro-player, with **5% extra processing
