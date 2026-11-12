@@ -1,3 +1,32 @@
+# monoMelon engine fork
+
+This is the melonDS engine used by [monoMelon](https://github.com/monofuel/mono-overlay/blob/master/docs/monomelon.md)
+through our [melonds-ds libretro fork](https://github.com/monofuel/melonds-ds).
+
+**Target:** Lost in Blue at native 100% speed on the **Anbernic RG DS Plus
+(RK3568 / Cortex-A55)** through mono-retro-player, with **5% extra processing
+headroom in each of four reference scenes**: cliff, river, inventory and ocean.
+This remains a work in progress, with emulation and rendering accuracy preserved.
+
+## Optimizations in this fork
+
+- ARM64 NEON background-tile batching and skipping empty sprite-priority passes.
+- Copying pixel groups directly when color effects cannot change their output.
+- Batched software 2D rendering on a worker, using scanline snapshots and reusing
+  unchanged palette/OAM data. The current default is eight scanlines per batch.
+- Ordered polygon lists per scanline and software 3D rendering across three
+  workers, with serial fallback for shadows and synchronization around state changes.
+- Cached scheduler deadlines to avoid repeatedly scanning for the next event.
+- Shared AArch64 JIT dispatch tails to reduce housekeeping between compiled blocks.
+
+[Regression tests](tests/monomelon) cover scheduler ordering, snapshots, generated
+JIT dispatch and rendering. Compiler tuning and open-demo PGO are provided by
+the Gentoo ebuild; they are separate from these engine changes.
+See [measurements and experiments](https://github.com/monofuel/mono-overlay/blob/master/docs/monomelon-performance.md)
+for results and candidates that have not been adopted.
+
+---
+
 <p align="center"><img src="https://raw.githubusercontent.com/melonDS-emu/melonDS/master/res/icon/melon_128x128.png"></p>
 <h2 align="center"><b>melonDS</b></h2>
 <p align="center">
