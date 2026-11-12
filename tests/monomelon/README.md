@@ -1,6 +1,6 @@
 # monoMelon renderer test
 
-The `monomelon` branch starts at JesseTG/melonDS commit
+The `master` branch carries monoMelon changes based on JesseTG/melonDS commit
 `16f127dbb587a73371827ce79689c5d237c4b59b`. It adds the existing ARM64 NEON
 background-tile path and conservative sprite-priority mask from mono-overlay
 `libretro-monomelon-1.4.0-r1`. The engine and these changes retain GPL-3.0-or-later.
@@ -17,9 +17,21 @@ Cross-compilation with an ARM64 compiler and execution under QEMU is also
 supported. This tests the tile helper; full-engine video/audio comparisons are
 still needed for scrolling, VRAM, sprite integration and new optimizations.
 
-The libretro wrapper lives at https://github.com/monofuel/melonds-ds/tree/monomelon.
+The libretro wrapper lives at https://github.com/monofuel/melonds-ds/tree/master.
 Build flags, open-demo PGO training and package checks live in
 https://github.com/monofuel/mono-overlay/tree/master/games-emulation/libretro-monomelon.
+
+The grouped color-compositing shortcut has a separate ARM64 test:
+
+```sh
+c++ -O2 -std=c++17 -Isrc tests/monomelon/test-unblended.cpp -o /tmp/test-unblended
+/tmp/test-unblended
+```
+
+It checks four million randomized pixels against scalar color effects and
+exhausts flag/mode/primary-target combinations with secondary targets on/off,
+ordinary/3D/sprite lower layers and window effects on/off. Only groups whose
+outputs are guaranteed unchanged bypass the original scalar compositor.
 
 ## GLES compute feasibility probe
 

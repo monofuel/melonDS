@@ -21,6 +21,7 @@
 #if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #include <algorithm>
 #include "GPU_TextNeon.h"
+#include "GPU_ColorOpNeon.h"
 #endif
 
 namespace melonDS
@@ -353,6 +354,21 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
     // color special effects
     // can likely be optimized
 
+#if defined(__aarch64__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    const u32 mode = (GPU2D.BlendCnt >> 6) & 3;
+    const u32 primaryTargets = mode ? (GPU2D.BlendCnt & 0x3F) << 24 : 0;
+    // Low bits cannot match the masked pixel, so ~0U disables the opaque-3D shortcut.
+    const u32 opaque3DPattern = (mode < 2 || !(GPU2D.BlendCnt & 1)) ? 0x5F000000 : ~0U;
+    for (int i = 0; i < 256; i += 4)
+    {
+        const uint32x4_t pixels = vld1q_u32(BGOBJLine + i);
+        if (CanCopyUnblendedPixelsNeon(pixels, primaryTargets, opaque3DPattern))
+            vst1q_u32(dst + i, pixels);
+        else
+            for (int j = 0; j < 4; j++)
+                dst[i+j] = ColorComposite(i+j, BGOBJLine[i+j], BGOBJLine[256+i+j]);
+    }
+#else
     for (int i = 0; i < 256; i++)
     {
         u32 val1 = BGOBJLine[i];
@@ -360,6 +376,7 @@ void SoftRenderer2D::DrawScanline_BGOBJ(u32 line, u32* dst)
 
         dst[i] = ColorComposite(i, val1, val2);
     }
+#endif
 }
 
 
