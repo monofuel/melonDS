@@ -97,6 +97,12 @@ toolchain file; execution under QEMU additionally needs the target runtime and
 `CMAKE_CROSSCOMPILING_EMULATOR`. These fixtures complement game video/PCM checks
 and performance measurements; they do not prove accuracy for every game.
 
+The FIFO fixture compares physical 32-bit writes with the ordinary I/O path,
+including all FIFO aliases, alignment, adjacent registers and geometry/rendering
+power combinations. It checks complete FIFO state, IRQ flags, CPU stalls and
+deadlines after each write. Routing changes retain the existing per-word handler
+and emulated timing.
+
 ## Parallel software 3D renderer
 
 The threaded software renderer divides non-shadow frames into three horizontal

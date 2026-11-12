@@ -21,6 +21,7 @@ This remains a work in progress, with emulation and rendering accuracy preserved
   workers, with serial fallback for shadows and synchronization around state changes.
 - Cached scheduler deadlines to avoid repeatedly scanning for the next event.
 - Shared AArch64 JIT dispatch tails to reduce housekeeping between compiled blocks.
+- Early geometry FIFO routing through the existing per-word register handler.
 
 [Regression tests](tests/monomelon) cover scheduler ordering, snapshots, generated
 JIT dispatch and rendering. Compiler tuning and open-demo PGO are provided by

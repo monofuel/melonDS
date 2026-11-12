@@ -2282,6 +2282,12 @@ void NDS::ARM9Write32(u32 addr, u32 val)
 {
     addr &= ~0x3;
 
+    if (addr >= 0x04000400 && addr < 0x04000440)
+    {
+        GPU.GPU3D.Write32(addr, val);
+        return;
+    }
+
     switch (addr & 0xFF000000)
     {
     case 0x02000000:
@@ -3472,6 +3478,13 @@ void NDS::ARM9IOWrite16(u32 addr, u16 val)
 
 void NDS::ARM9IOWrite32(u32 addr, u32 val)
 {
+    // Route frequent FIFO data writes before the unrelated register cases.
+    if (addr >= 0x04000400 && addr < 0x04000440)
+    {
+        GPU.GPU3D.Write32(addr, val);
+        return;
+    }
+
     switch (addr)
     {
     case 0x04000004:

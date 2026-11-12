@@ -2825,6 +2825,12 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
     if (!RenderingEnabled && addr >= 0x04000320 && addr < 0x04000400) return;
     if (!GeometryEnabled  && addr >= 0x04000400 && addr < 0x04000700) return;
 
+    if (addr >= 0x04000400 && addr < 0x04000440)
+    {
+        WriteToGXFIFO(val);
+        return;
+    }
+
     switch (addr)
     {
     case 0x04000060:
@@ -2870,12 +2876,6 @@ void GPU3D::Write32(u32 addr, u32 val) noexcept
     case 0x04000610:
         val &= 0x7FFF;
         ZeroDotWLimit = (val * 0x200) + 0x1FF;
-        return;
-    }
-
-    if (addr >= 0x04000400 && addr < 0x04000440)
-    {
-        WriteToGXFIFO(val);
         return;
     }
 
