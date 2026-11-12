@@ -411,14 +411,37 @@ void SoftRenderer::CaptureLine(SoftLineRecord& rec, u32 line)
 
     SoftRenderer2D::CaptureState(GPU.GPU2D_A, rec.Engine[0]);
     SoftRenderer2D::CaptureState(GPU.GPU2D_B, rec.Engine[1]);
-    memcpy(rec.Palette, GPU.Palette, sizeof(rec.Palette));
+    // Backdrop writes have separate dirty bits and can include the next colour.
+    if (GPU.PaletteDirty & ~0x50u)
+        ++PaletteGeneration;
+    GPU.PaletteDirty = 0;
+    // Reuse a consumed slot's immutable bytes until guest writes change them.
+    if (rec.PaletteGeneration != PaletteGeneration)
+    {
+        memcpy(rec.Palette, GPU.Palette, sizeof(rec.Palette));
+        rec.PaletteGeneration = PaletteGeneration;
+    }
+    else
+    {
+        memcpy(rec.Palette, GPU.Palette, sizeof(u32));
+        memcpy(rec.Palette + 0x400, GPU.Palette + 0x400, sizeof(u32));
+    }
 }
 
 void SoftRenderer::CaptureSprites(SoftLineRecord& rec, u32 line)
 {
     rec.HasSprites = true;
     rec.SpriteLine = line;
-    memcpy(rec.OAM, GPU.OAM, sizeof(rec.OAM));
+    if (GPU.OAMDirty)
+    {
+        ++OAMGeneration;
+        GPU.OAMDirty = 0;
+    }
+    if (rec.OAMGeneration != OAMGeneration)
+    {
+        memcpy(rec.OAM, GPU.OAM, sizeof(rec.OAM));
+        rec.OAMGeneration = OAMGeneration;
+    }
 }
 
 void SoftRenderer::RenderRecord(SoftLineRecord& rec)

@@ -246,6 +246,8 @@ public:
 
     melonDS::NDS& NDS;
     ptrdiff_t OtherCodeRegion;
+    const void* DispatchTail[2];
+    const void* Gen_DispatchTail(u32 num);
 
     bool Exit;
 

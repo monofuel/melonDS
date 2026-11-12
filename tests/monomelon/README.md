@@ -24,7 +24,7 @@ https://github.com/monofuel/mono-overlay/tree/master/games-emulation/libretro-mo
 ## Batched software 2D renderer
 
 The threaded software renderer queues register/palette/OAM snapshots in batches
-of 16 lines. Emulation keeps the original register and VRAM timing; a worker
+of 8 lines. Emulation keeps the original register and VRAM timing; a worker
 draws from immutable records and stable flattened VRAM. Capture and raw VRAM/FIFO
 display modes remain inline. State operations drain the queue and preserve window
 carry. Disabling threaded rendering uses the same snapshot path serially.
@@ -65,6 +65,37 @@ It checks four million randomized pixels against scalar color effects and
 exhausts flag/mode/primary-target combinations with secondary targets on/off,
 ordinary/3D/sprite lower layers and window effects on/off. Only groups whose
 outputs are guaranteed unchanged bypass the original scalar compositor.
+
+## Scheduler, snapshots and AArch64 dispatch
+
+These standalone fixtures build the real engine without a graphical frontend,
+ROMs or BIOS files:
+
+```sh
+cmake -S tests/monomelon -B /tmp/monomelon-regressions -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/monomelon-regressions -j4
+ctest --test-dir /tmp/monomelon-regressions --output-on-failure
+```
+
+The scheduler fixture compares cached deadlines with a full scan across
+cancellation, callback rescheduling and reentrant deadline queries, sleep,
+reset, state loading and 20,000 transitions. The snapshot fixture compares all
+palette/OAM bytes through reused slots, including backdrop-only 16/32-bit
+writes and lifecycle changes. Palette/OAM snapshots remain immutable while
+queued; generation counters only avoid recopying unchanged bytes.
+
+On AArch64 with JIT enabled, the dispatch fixture executes the actual generated
+tails for both CPUs and ARM/Thumb modes. It checks cycles, flags, changed
+deadlines, IRQ handoff, invalidated/wrong-tag entries, region exits and cache
+reset against the original exit path. The shared tails preserve block boundaries
+and use the normal tagged lookup table. `MONOMELON_JIT_DISPATCH=0` selects the
+original exit path for comparisons; the default is enabled on AArch64.
+
+The same CMake project also runs the 120-frame 3D/lifecycle fixture. Test
+assertions stay enabled in release builds. Cross builds accept a normal CMake
+toolchain file; execution under QEMU additionally needs the target runtime and
+`CMAKE_CROSSCOMPILING_EMULATOR`. These fixtures complement game video/PCM checks
+and performance measurements; they do not prove accuracy for every game.
 
 ## Parallel software 3D renderer
 

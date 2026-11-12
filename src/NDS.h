@@ -508,6 +508,8 @@ public: // TODO: Encapsulate the rest of these members
 protected:
     void InitTimings();
     u32 SchedListMask;
+    u64 NextEventTimestamp = UINT64_MAX;
+    bool NextEventValid = false;
     u64 SysTimestamp;
     u8 WRAMCnt;
     u8 PostFlag9;
@@ -536,6 +538,7 @@ protected:
     u64 LastSysClockCycles;
     u64 FrameStartTimestamp;
     u64 NextTarget();
+    u64 NextEvent();
     u64 NextTargetSleep();
     void CheckKeyIRQ(u32 cpu, u32 oldkey, u32 newkey);
     void Reschedule(u64 target);

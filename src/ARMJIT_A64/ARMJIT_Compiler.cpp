@@ -669,7 +669,7 @@ void Compiler::Comp_BranchSpecialBehaviour(bool taken)
 
         if (ConstantCycles)
             ADD(RCycles, RCycles, ConstantCycles);
-        QuickTailCall(X0, ARM_Ret);
+        QuickTailCall(X0, DispatchTail[Num]);
     }
 }
 
@@ -821,11 +821,69 @@ JitBlockEntry Compiler::CompileBlock(ARM* cpu, bool thumb, FetchedInstr instrs[]
 
     if (ConstantCycles)
         ADD(RCycles, RCycles, ConstantCycles);
-    QuickTailCall(X0, ARM_Ret);
+    QuickTailCall(X0, DispatchTail[Num]);
 
     FlushIcache();
 
     return res;
+}
+
+const void* Compiler::Gen_DispatchTail(u32 num)
+{
+    const void* entry = GetRXPtr();
+
+    // Preserve the original block boundary and leave IRQ/halt handling to C++.
+    STR(INDEX_UNSIGNED, RCPSR, RCPU, offsetof(ARM, CPSR));
+    LDR(INDEX_UNSIGNED, W0, RCPU, offsetof(ARM, StopExecution));
+    FixupBranch stopped = CBNZ(W0);
+
+    static_assert(offsetof(melonDS::NDS, ARM9Target) == offsetof(melonDS::NDS, ARM9Timestamp) + sizeof(u64));
+    static_assert(offsetof(melonDS::NDS, ARM7Target) == offsetof(melonDS::NDS, ARM7Timestamp) + sizeof(u64));
+    MOVP2R(X0, num ? &NDS.ARM7Timestamp : &NDS.ARM9Timestamp);
+    LDP(INDEX_SIGNED, X1, X2, X0, 0);
+    SXTW(X3, RCycles);
+    ADD(X1, X1, X3);
+    STR(INDEX_UNSIGNED, X1, X0, 0);
+    MOVI2R(RCycles, 0);
+    STR(INDEX_UNSIGNED, RCycles, RCPU, offsetof(ARM, Cycles));
+    CMP(X1, X2);
+    FixupBranch reached = B(CC_HS);
+
+    LDR(INDEX_UNSIGNED, W3, RCPU, offsetof(ARM, R[15]));
+    UBFX(W4, RCPSR, 5, 1);
+    LSL(W4, W4, 1);
+    SUB(W3, W3, 4);
+    ADD(W3, W3, W4);
+    LDR(INDEX_UNSIGNED, W4, RCPU, offsetof(ARM, FastBlockLookupStart));
+    CMP(W3, W4);
+    FixupBranch below = B(CC_LO);
+    LDR(INDEX_UNSIGNED, W5, RCPU, offsetof(ARM, FastBlockLookupSize));
+    ADD(W5, W5, W4);
+    CMP(W3, W5);
+    FixupBranch above = B(CC_HS);
+    SUB(W4, W3, W4);
+    LSR(W4, W4, 1);
+    LDR(INDEX_UNSIGNED, X5, RCPU, offsetof(ARM, FastBlockLookup));
+    LDR(X5, X5, ArithOption(W4, true));
+
+    // Re-read the normal table entry so invalidated blocks cannot be chained.
+    LSR(X6, X5, 32);
+    if (num)
+        ORRI2R(W3, W3, num);
+    CMP(X6, X3);
+    FixupBranch missing = B(CC_NEQ);
+    MOV(W5, W5);
+    MOVP2R(X6, GetRXBase());
+    ADD(X5, X6, X5);
+    BR(X5);
+
+    SetJumpTarget(stopped);
+    SetJumpTarget(reached);
+    SetJumpTarget(below);
+    SetJumpTarget(above);
+    SetJumpTarget(missing);
+    QuickTailCall(X0, ARM_Ret);
+    return entry;
 }
 
 void Compiler::Reset()
@@ -839,6 +897,12 @@ void Compiler::Reset()
 
     for (int i = 0; i < (JitMemMainSize + JitMemSecondarySize) / 4; i++)
         *(((u32*)GetRWPtr()) + i) = brk_0;
+
+    const char* dispatch = getenv("MONOMELON_JIT_DISPATCH");
+    for (u32 num = 0; num < 2; ++num)
+        DispatchTail[num] = dispatch && dispatch[0] == '0' && dispatch[1] == '\0'
+            ? (const void*)ARM_Ret : Gen_DispatchTail(num);
+    FlushIcache();
 }
 
 void Compiler::Comp_AddCycles_C(bool forceNonConstant)

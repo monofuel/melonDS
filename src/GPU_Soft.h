@@ -59,6 +59,8 @@ struct SoftLineRecord
 
     Soft2DState Engine[2];
 
+    u64 PaletteGeneration = 0;
+    u64 OAMGeneration = 0;
     alignas(8) u8 Palette[2*1024];
     alignas(8) u8 OAM[2*1024];
 };
@@ -112,7 +114,7 @@ private:
     // One slot always stays free for a fence or stop record.
     static constexpr u32 RingSize = 32;
     static constexpr u32 RingMask = RingSize - 1;
-    static constexpr u32 DefaultBatchSize = 16;
+    static constexpr u32 DefaultBatchSize = 8;
     static constexpr u32 MaxBatchSize = 16;
 
     // After this many waits forced by mid-frame VRAM cache updates, the rest of the frame
@@ -146,6 +148,8 @@ private:
     SoftLineRecord* OpenRecord = nullptr; // scanline captured, waiting for its DrawSprites
     u32 DirtyWaitsThisFrame = 0;
     SoftBatch2DStats Stats {};
+    u64 PaletteGeneration = 1;
+    u64 OAMGeneration = 1;
 
     alignas(64) std::atomic<u32> QueuePublished {0}; // written by the emulation thread
     alignas(64) std::atomic<u32> QueueConsumed {0};  // written by the worker

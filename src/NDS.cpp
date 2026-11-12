@@ -534,6 +534,7 @@ void NDS::Reset()
         evt.Param = 0;
     }
     SchedListMask = 0;
+    NextEventValid = false;
 
     KeyInput = 0x007F03FF;
     KeyCnt[0] = 0;
@@ -707,6 +708,7 @@ bool NDS::DoSavestate(Savestate* file)
         file->Var32(&evt.Param);
     }
     file->Var32(&SchedListMask);
+    NextEventValid = false;
     file->Var64(&ARM9Timestamp);
     file->Var64(&ARM9Target);
     file->Var64(&ARM7Timestamp);
@@ -813,8 +815,11 @@ void NDS::SetARM9BIOS(const std::array<u8, ARM9BIOSSize>& bios) noexcept
     ARM9BIOSNative = CRC32(ARM9BIOS.data(), ARM9BIOS.size()) == ARM9BIOSCRC32;
 }
 
-u64 NDS::NextTarget()
+u64 NDS::NextEvent()
 {
+    if (NextEventValid)
+        return NextEventTimestamp;
+
     u64 minEvent = UINT64_MAX;
 
     u32 mask = SchedListMask;
@@ -830,6 +835,14 @@ u64 NDS::NextTarget()
         mask >>= 1;
     }
 
+    NextEventTimestamp = minEvent;
+    NextEventValid = true;
+    return minEvent;
+}
+
+u64 NDS::NextTarget()
+{
+    u64 minEvent = NextEvent();
     u64 max = SysTimestamp + kMaxIterationCycles;
 
     if (minEvent < max + kIterationCycleMargin)
@@ -842,6 +855,9 @@ void NDS::RunSystem(u64 timestamp)
 {
     SysTimestamp = timestamp;
 
+    if (NextEvent() > timestamp)
+        return;
+
     u32 mask = SchedListMask;
     for (int i = 0; i < Event_MAX; i++)
     {
@@ -853,6 +869,7 @@ void NDS::RunSystem(u64 timestamp)
             if (evt.Timestamp <= SysTimestamp)
             {
                 SchedListMask &= ~(1<<i);
+                NextEventValid = false;
 
                 EventFunc func = evt.Funcs[evt.FuncID];
                 func(evt.That, evt.Param);
@@ -888,6 +905,7 @@ u64 NDS::NextTargetSleep()
 
 void NDS::RunSystemSleep(u64 timestamp)
 {
+    NextEventValid = false;
     u64 offset = timestamp - SysTimestamp;
     SysTimestamp = timestamp;
 
@@ -904,6 +922,7 @@ void NDS::RunSystemSleep(u64 timestamp)
                 if (evt.Timestamp <= SysTimestamp)
                 {
                     SchedListMask &= ~(1<<i);
+                    NextEventValid = false;
 
                     EventFunc func = evt.Funcs[evt.FuncID];
                     func(evt.That, evt.Param);
@@ -915,6 +934,7 @@ void NDS::RunSystemSleep(u64 timestamp)
             if (SchedList[i].Timestamp <= SysTimestamp)
             {
                 SchedList[i].Timestamp += offset;
+                NextEventValid = false;
             }
         }
 
@@ -1153,12 +1173,16 @@ void NDS::ScheduleEvent(u32 id, bool periodic, s32 delay, u32 funcid, u32 param)
 
     SchedListMask |= (1<<id);
 
+    if (NextEventValid && evt.Timestamp < NextEventTimestamp)
+        NextEventTimestamp = evt.Timestamp;
+
     Reschedule(evt.Timestamp);
 }
 
 void NDS::CancelEvent(u32 id)
 {
     SchedListMask &= ~(1<<id);
+    NextEventValid = false;
 }
 
 
