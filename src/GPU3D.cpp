@@ -19,6 +19,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#if defined(MONOMELON_NEON_MATRIX) && defined(__aarch64__)
+#include <arm_neon.h>
+#include <cstdint>
+#endif
 #include "NDS.h"
 #include "GPU.h"
 #include "FIFO.h"
@@ -579,6 +583,32 @@ void MatrixLoad4x3(s32* m, s32* s)
 
 void MatrixMult4x4(s32* m, s32* s)
 {
+#if defined(MONOMELON_NEON_MATRIX) && defined(__aarch64__)
+    // Retain the original sequential-write semantics whenever inputs overlap.
+    const uintptr_t a = reinterpret_cast<uintptr_t>(m);
+    const uintptr_t b = reinterpret_cast<uintptr_t>(s);
+    if ((a <= b && b - a >= 64) || (b < a && a - b >= 64))
+    {
+        const int32x4_t t0 = vld1q_s32(m);
+        const int32x4_t t1 = vld1q_s32(m + 4);
+        const int32x4_t t2 = vld1q_s32(m + 8);
+        const int32x4_t t3 = vld1q_s32(m + 12);
+        for (int row = 0; row < 4; ++row)
+        {
+            const int32x4_t coefficients = vld1q_s32(s + row * 4);
+            int64x2_t low = vmull_laneq_s32(vget_low_s32(t0), coefficients, 0);
+            int64x2_t high = vmull_high_laneq_s32(t0, coefficients, 0);
+            low = vmlal_laneq_s32(low, vget_low_s32(t1), coefficients, 1);
+            high = vmlal_high_laneq_s32(high, t1, coefficients, 1);
+            low = vmlal_laneq_s32(low, vget_low_s32(t2), coefficients, 2);
+            high = vmlal_high_laneq_s32(high, t2, coefficients, 2);
+            low = vmlal_laneq_s32(low, vget_low_s32(t3), coefficients, 3);
+            high = vmlal_high_laneq_s32(high, t3, coefficients, 3);
+            vst1q_s32(m + row * 4, vcombine_s32(vshrn_n_s64(low, 12), vshrn_n_s64(high, 12)));
+        }
+        return;
+    }
+#endif
     s32 tmp[16];
     memcpy(tmp, m, 16*4);
 

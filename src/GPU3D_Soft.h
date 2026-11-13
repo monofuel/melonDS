@@ -516,6 +516,15 @@ private:
     void StartHelper(int index);
     void StopHelper(int index);
 
+#ifdef MONOMELON_LAZY_BAND_COPY
+    void MaterializeBands();
+    void SeedOwnedRow(SoftRenderer3D& destination, s32 row);
+    // Completed ownership is published before RenderDone, independently of FrameStart.
+    // Primary owns physical rows [0, start+1), helpers their interiors and last border.
+    int OwnedHelpers = 0;
+    s32 OwnedStart[MaxBandHelpers] = {};
+#endif
+
     void RenderThreadFunc();
     void HelperThreadFunc(int index);
 

@@ -34,7 +34,10 @@ const int kXRegSizeInBits = 64;
 // The below few functions are taken from V8.
 int CountLeadingZeros(uint64_t value, int width)
 {
-  // TODO(jbramley): Optimize this for ARM64 hosts.
+#if defined(__GNUC__) || defined(__clang__)
+  if (width == 64)
+    return value == 0 ? 64 : __builtin_clzll(value);
+#endif
   int count = 0;
   uint64_t bit_test = 1ULL << (width - 1);
   while ((count < width) && ((bit_test & value) == 0))

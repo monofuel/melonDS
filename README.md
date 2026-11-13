@@ -28,6 +28,12 @@ This remains a work in progress, with emulation and rendering accuracy preserved
   retaining the original interpolation arithmetic and W-buffer behavior.
 - Keeping software depth tests inline instead of calling through a function
   pointer for each pixel, preserving depth tolerances and facing rules.
+- Exact AArch64 NEON 4×4 matrix multiplication, retaining the scalar path when
+  the input arrays overlap.
+- Retaining completed software 3D helper buffers between frames, copying boundary
+  history and restoring canonical storage when rendering modes change.
+- Using the compiler's leading-zero instruction for 64-bit logical-immediate
+  classification during ARM64 JIT compilation, with unchanged emitted code.
 
 [Regression tests](tests/monomelon) cover scheduler ordering, snapshots, generated
 JIT dispatch and rendering. Compiler tuning and open-demo PGO are provided by

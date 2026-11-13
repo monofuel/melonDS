@@ -44,24 +44,80 @@ struct SoftRenderer3DTestAccess
         bool PrevIsShadowMask;
     };
 
-    static State Get(R& r)
+    static State Get(R& r, bool resolve = true)
     {
         State s;
         s.Color.assign(r.ColorBuffer, r.ColorBuffer + Words);
         s.Depth.assign(r.DepthBuffer, r.DepthBuffer + Words);
         s.Attr.assign(r.AttrBuffer, r.AttrBuffer + Words);
+#ifdef MONOMELON_LAZY_BAND_COPY
+        // Resolve into the snapshot only. Never repair primary storage while testing
+        // consecutive frames: doing so would hide stale history and ownership bugs.
+        if (resolve)
+            for (int k = 0; k < r.OwnedHelpers; k++)
+            {
+                const auto& owner = *r.Helpers[k];
+                int first = (r.OwnedStart[k] + 1) * ScanlineWidth;
+                int end = (k + 1 < r.OwnedHelpers ? r.OwnedStart[k + 1] + 1 : R::NumScanlines) * ScanlineWidth;
+                for (int layer = 0; layer < 2; layer++)
+                    for (int i = first; i < end; i++)
+                    {
+                        int offset = layer * BufferSize + i;
+                        s.Color[offset] = owner.ColorBuffer[offset];
+                        s.Depth[offset] = owner.DepthBuffer[offset];
+                        s.Attr[offset] = owner.AttrBuffer[offset];
+                    }
+            }
+#endif
         memcpy(s.Stencil, r.StencilBuffer, 512);
         s.PrevIsShadowMask = r.PrevIsShadowMask;
         return s;
     }
     static void Put(R& r, const State& s)
     {
+#ifdef MONOMELON_LAZY_BAND_COPY
+        r.WaitPendingFrame();
+        r.OwnedHelpers = 0;
+#endif
         memcpy(r.ColorBuffer, s.Color.data(), Words * 4);
         memcpy(r.DepthBuffer, s.Depth.data(), Words * 4);
         memcpy(r.AttrBuffer, s.Attr.data(), Words * 4);
         memcpy(r.StencilBuffer, s.Stencil, 512);
         r.PrevIsShadowMask = s.PrevIsShadowMask;
     }
+#ifdef MONOMELON_LAZY_BAND_COPY
+    static bool Lazy(const R& r) { return r.OwnedHelpers != 0; }
+    static void Materialize(R& r) { r.WaitPendingFrame(); r.MaterializeBands(); }
+    static void SetRawBounds(R& r, int workers, int a, int b)
+    {
+        r.BandWorkers = workers;
+        r.BandSplit = a;
+        r.BandSplits3[0] = a;
+        r.BandSplits3[1] = b;
+    }
+    static void CorruptUnownedRows(R& r)
+    {
+        // Poison only lower-layer nonowners, including every side-border column.
+        // Owned history is deliberately left intact.
+        auto poison = [](R& target, int row)
+        {
+            int first = BufferSize + row * ScanlineWidth;
+            for (int x = 0; x < ScanlineWidth; x++)
+            {
+                target.ColorBuffer[first+x] ^= 0x12abcdef;
+                target.DepthBuffer[first+x] ^= 0x123456;
+                target.AttrBuffer[first+x] ^= 0x12000000;
+            }
+        };
+        poison(r, r.OwnedStart[0] + 1);
+        for (int k = 0; k < r.OwnedHelpers; k++)
+        {
+            poison(*r.Helpers[k], r.OwnedStart[k]);
+            if (k + 1 < r.OwnedHelpers)
+                poison(*r.Helpers[k], r.OwnedStart[k + 1] + 1);
+        }
+    }
+#endif
     static void SetBands(R& r, bool enabled, int split)
     {
         r.BandsEnabled = enabled;

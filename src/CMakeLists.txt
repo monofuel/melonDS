@@ -85,6 +85,11 @@ add_library(core STATIC
 
     blip-buf/blip_buf.c)
 
+option(MONOMELON_LAZY_BAND_COPY "Retain authoritative software helper bands until a transition" OFF)
+if(MONOMELON_LAZY_BAND_COPY)
+    target_compile_definitions(core PUBLIC MONOMELON_LAZY_BAND_COPY=1)
+endif()
+
 if (ENABLE_GDBSTUB)
     message(NOTICE "Enabling GDB stub")
     target_sources(core PRIVATE
@@ -243,3 +248,8 @@ endif()
 #  )
 #endif()
 
+# Other architectures retain the scalar matrix path.
+option(MONOMELON_NEON_MATRIX "Use exact AArch64 integer matrix multiplication" OFF)
+if(MONOMELON_NEON_MATRIX)
+    target_compile_definitions(core PRIVATE MONOMELON_NEON_MATRIX=1)
+endif()

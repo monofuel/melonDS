@@ -112,6 +112,10 @@ void SoftRenderer3D::StopRenderThread()
 
 void SoftRenderer3D::SetHelperCount(int count)
 {
+#ifdef MONOMELON_LAZY_BAND_COPY
+    // Callers have joined the frame; preserve owners before stopping any helper.
+    MaterializeBands();
+#endif
     for (int k = 0; k < MaxBandHelpers; k++)
     {
         if (k < count)
@@ -218,6 +222,9 @@ void SoftRenderer3D::PublishFrameMode()
     // consumer has drained, and before it can see a line from the new frame.
     if (!CanBandFrame())
     {
+#ifdef MONOMELON_LAZY_BAND_COPY
+        MaterializeBands();
+#endif
         FrameHelpers = 0;
         return;
     }
@@ -229,6 +236,12 @@ void SoftRenderer3D::PublishFrameMode()
         FrameStart[0] = BandSplits3[0];
         FrameStart[1] = BandSplits3[1];
     }
+#ifdef MONOMELON_LAZY_BAND_COPY
+    // Previous ownership is independent of the newly published frame domain.
+    if (OwnedHelpers != FrameHelpers ||
+        !std::equal(OwnedStart, OwnedStart + OwnedHelpers, FrameStart))
+        MaterializeBands();
+#endif
 }
 
 void SoftRenderer3D::EnableRenderThread()
@@ -285,6 +298,11 @@ void SoftRenderer3D::Reset()
 {
     // The render thread may still be reading these buffers.
     WaitPendingFrame();
+
+#ifdef MONOMELON_LAZY_BAND_COPY
+    // Reset discards both layers, so stale helper storage must not be restored.
+    OwnedHelpers = 0;
+#endif
 
     memset(ColorBuffer, 0, BufferSize * 2 * 4);
     memset(DepthBuffer, 0, BufferSize * 2 * 4);
@@ -1929,6 +1947,45 @@ void SoftRenderer3D::RenderBand(Polygon** polygons, int npolys, s32 rasterStart,
     }
 }
 
+#ifdef MONOMELON_LAZY_BAND_COPY
+void SoftRenderer3D::MaterializeBands()
+{
+    // Only called after the pending frame has joined, before owners can change.
+    for (int k = 0; k < OwnedHelpers; k++)
+    {
+        const SoftRenderer3D& source = *Helpers[k];
+        const size_t first = (size_t)(OwnedStart[k] + 1) * ScanlineWidth;
+        const s32 end = k + 1 < OwnedHelpers ? OwnedStart[k + 1] + 1 : NumScanlines;
+        const size_t bytes = ((size_t)end * ScanlineWidth - first) * sizeof(u32);
+        for (size_t layer = 0; layer < 2; layer++)
+        {
+            const size_t offset = first + layer * BufferSize;
+            memcpy(ColorBuffer + offset, source.ColorBuffer + offset, bytes);
+            memcpy(DepthBuffer + offset, source.DepthBuffer + offset, bytes);
+            memcpy(AttrBuffer + offset, source.AttrBuffer + offset, bytes);
+        }
+    }
+    OwnedHelpers = 0;
+}
+
+void SoftRenderer3D::SeedOwnedRow(SoftRenderer3D& destination, s32 row)
+{
+    // Resolve only owned interiors (and the last border), never a rendered halo.
+    const SoftRenderer3D* source = this;
+    for (int k = OwnedHelpers - 1; k >= 0; k--)
+        if (row > OwnedStart[k])
+        {
+            source = Helpers[k].get();
+            break;
+        }
+    if (source == &destination) return;
+    const size_t offset = BufferSize + (size_t)row * ScanlineWidth;
+    memcpy(destination.ColorBuffer + offset, source->ColorBuffer + offset, ScanlineWidth * sizeof(u32));
+    memcpy(destination.DepthBuffer + offset, source->DepthBuffer + offset, ScanlineWidth * sizeof(u32));
+    memcpy(destination.AttrBuffer + offset, source->AttrBuffer + offset, ScanlineWidth * sizeof(u32));
+}
+#endif
+
 void SoftRenderer3D::RenderBandedFrame()
 {
     // Edge marking reads the opaque polygon ID and depth of the rows above and below, so
@@ -1942,22 +1999,44 @@ void SoftRenderer3D::RenderBandedFrame()
     // which covers both halo rows and, for the last band, the bottom border row. Together
     // with the copy back below, this context then holds exactly the buffers a single-band
     // frame would produce.
+#ifdef MONOMELON_LAZY_BAND_COPY
+    // With lazy ownership, keep completed interiors and seed only nonowned boundaries.
+    // A transition materializes all owners, returning to the full seed path below.
+#endif
     for (int k = 0; k < nhelpers; k++)
     {
         SoftRenderer3D& helper = *Helpers[k];
         s32 start = FrameStart[k];
         s32 end = (k + 1 < nhelpers) ? FrameStart[k + 1] : 192;
+#ifdef MONOMELON_LAZY_BAND_COPY
+        if (OwnedHelpers)
+        {
+            SeedOwnedRow(helper, start);
+            SeedOwnedRow(helper, end + 1);
+        }
+        else
+        {
+#endif
         s32 seedEnd = std::min(end + 2, (s32)NumScanlines);
         size_t first = BufferSize + (size_t)start * ScanlineWidth;
         size_t count = (size_t)(seedEnd - start) * ScanlineWidth;
         memcpy(&helper.ColorBuffer[first], &ColorBuffer[first], count * 4);
         memcpy(&helper.DepthBuffer[first], &DepthBuffer[first], count * 4);
         memcpy(&helper.AttrBuffer[first], &AttrBuffer[first], count * 4);
+#ifdef MONOMELON_LAZY_BAND_COPY
+        }
+#endif
         helper.PrevIsShadowMask = PrevIsShadowMask;
         helper.FrameSplit = start;
         helper.FrameEnd = end;
         helper.FrameHalo = halo;
     }
+#ifdef MONOMELON_LAZY_BAND_COPY
+    // The primary's lower halo was overwritten last frame and is not authoritative.
+    // Refresh it before helpers or the primary can modify their owned interiors.
+    if (OwnedHelpers && halo)
+        SeedOwnedRow(*this, FrameStart[0] + 1);
+#endif
     for (int k = 0; k < nhelpers; k++)
         Platform::Semaphore_Post(Helpers[k]->Sema_RenderStart);
 
@@ -1979,6 +2058,7 @@ void SoftRenderer3D::RenderBandedFrame()
     for (int k = 0; k < nhelpers; k++)
     {
         SoftRenderer3D& helper = *Helpers[k];
+#ifndef MONOMELON_LAZY_BAND_COPY
         s32 start = FrameStart[k];
         s32 copyEnd = (k + 1 < nhelpers) ? FrameStart[k + 1] + 1 : (s32)NumScanlines;
         size_t first = (size_t)(start + 1) * ScanlineWidth;
@@ -1990,8 +2070,14 @@ void SoftRenderer3D::RenderBandedFrame()
             memcpy(&DepthBuffer[o], &helper.DepthBuffer[o], count * 4);
             memcpy(&AttrBuffer[o], &helper.AttrBuffer[o], count * 4);
         }
+#endif
         PrevIsShadowMask = PrevIsShadowMask && helper.PrevIsShadowMask;
     }
+#ifdef MONOMELON_LAZY_BAND_COPY
+    // Publish completed ownership before Sema_RenderDone releases the owner thread.
+    OwnedHelpers = nhelpers;
+    std::copy(FrameStart, FrameStart + nhelpers, OwnedStart);
+#endif
 }
 
 void SoftRenderer3D::RenderHelperBand()
