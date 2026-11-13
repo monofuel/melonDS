@@ -24,6 +24,8 @@ This remains a work in progress, with emulation and rendering accuracy preserved
 - Early geometry FIFO routing through the existing per-word register handler.
 - Skipping clipping passes for polygons already inside the view volume, preserving
   vertex colour rounding and strip reuse.
+- Deferring perspective division until a pixel passes depth testing, while
+  retaining the original interpolation arithmetic and W-buffer behavior.
 
 [Regression tests](tests/monomelon) cover scheduler ordering, snapshots, generated
 JIT dispatch and rendering. Compiler tuning and open-demo PGO are provided by

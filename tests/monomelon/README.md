@@ -6,6 +6,11 @@ reused strip vertices and both attribute modes. It also exercises actual clippin
 and empty input. The test includes the implementation to access its helper
 templates without adding an engine API.
 
+The interpolator fixture compares split depth/attribute preparation with the
+existing unsplit `SetX` path. It covers X/Y interpolation, Z/W buffering,
+linear and perspective modes, zero/wrapping spans, signed extremes and
+consecutive rejected pixels. It runs in the same CMake suite.
+
 The `master` branch carries monoMelon changes based on JesseTG/melonDS commit
 `16f127dbb587a73371827ce79689c5d237c4b59b`. It adds the existing ARM64 NEON
 background-tile path and conservative sprite-priority mask from mono-overlay
