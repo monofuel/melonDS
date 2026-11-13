@@ -550,46 +550,32 @@ void SoftRenderer3D::TextureLookup(u32 texparam, u32 texpal, s16 s, s16 t, u16* 
 // Z-buffering: +-0x200
 // W-buffering: +-0xFF
 
-bool DepthTest_Equal_Z(s32 dstz, s32 z, u32 dstattr)
+namespace
 {
-    s32 diff = dstz - z;
-    if ((u32)(diff + 0x200) <= 0x400)
-        return true;
 
-    return false;
-}
-
-bool DepthTest_Equal_W(s32 dstz, s32 z, u32 dstattr)
+struct DepthTest
 {
-    s32 diff = dstz - z;
-    if ((u32)(diff + 0xFF) <= 0x1FE)
-        return true;
+    const s32 Tolerance;
+    const bool Facing;
 
-    return false;
-}
+    explicit DepthTest(const Polygon& polygon)
+        : Tolerance((polygon.Attr & (1 << 14)) ? (polygon.WBuffer ? 0xFF : 0x200) : 0),
+          Facing(polygon.FacingView)
+    {}
 
-bool DepthTest_LessThan(s32 dstz, s32 z, u32 dstattr)
-{
-    if (z < dstz)
-        return true;
-
-    return false;
-}
-
-bool DepthTest_LessThan_FrontFacing(s32 dstz, s32 z, u32 dstattr)
-{
-    if ((dstattr & 0x00400010) == 0x00000010) // opaque, back facing
+    bool operator()(s32 dstz, s32 z, u32 dstattr) const
     {
-        if (z <= dstz)
-            return true;
+        if (Tolerance)
+        {
+            const s32 diff = dstz - z;
+            return (u32)(diff + Tolerance) <= (u32)(Tolerance * 2);
+        }
+        if (Facing && (dstattr & 0x00400010) == 0x00000010)
+            return z <= dstz;
+        return z < dstz;
     }
-    else
-    {
-        if (z < dstz)
-            return true;
-    }
+};
 
-    return false;
 }
 
 u32 SoftRenderer3D::AlphaBlend(u32 srccolor, u32 dstcolor, u32 alpha) const noexcept
@@ -893,13 +879,7 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
     u32 polyalpha = (polygon->Attr >> 16) & 0x1F;
     bool wireframe = (polyalpha == 0);
 
-    bool (*fnDepthTest)(s32 dstz, s32 z, u32 dstattr);
-    if (polygon->Attr & (1<<14))
-        fnDepthTest = polygon->WBuffer ? DepthTest_Equal_W : DepthTest_Equal_Z;
-    else if (polygon->FacingView)
-        fnDepthTest = DepthTest_LessThan_FrontFacing;
-    else
-        fnDepthTest = DepthTest_LessThan;
+    const DepthTest depthTest(*polygon);
 
     if (!PrevIsShadowMask)
         memset(&StencilBuffer[256 * (y&0x1)], 0, 256);
@@ -1044,13 +1024,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         s32 z = interpX.InterpolateZ(zl, zr);
         u32 dstattr = AttrBuffer[pixeladdr];
 
-        if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+        if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
             StencilBuffer[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
-            if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
+            if (!depthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
                 StencilBuffer[256*(y&0x1) + x] |= 0x2;
         }
     }
@@ -1070,13 +1050,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         s32 z = interpX.InterpolateZ(zl, zr);
         u32 dstattr = AttrBuffer[pixeladdr];
 
-        if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+        if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
             StencilBuffer[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
-            if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
+            if (!depthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
                 StencilBuffer[256*(y&0x1) + x] |= 0x2;
         }
     }
@@ -1096,13 +1076,13 @@ void SoftRenderer3D::RenderShadowMaskScanline(RendererPolygon* rp, s32 y)
         s32 z = interpX.InterpolateZ(zl, zr);
         u32 dstattr = AttrBuffer[pixeladdr];
 
-        if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+        if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
             StencilBuffer[256*(y&0x1) + x] = 1;
 
         if (dstattr & 0xF)
         {
             pixeladdr += BufferSize;
-            if (!fnDepthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
+            if (!depthTest(DepthBuffer[pixeladdr], z, AttrBuffer[pixeladdr]))
                 StencilBuffer[256*(y&0x1) + x] |= 0x2;
         }
     }
@@ -1121,13 +1101,7 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
     u32 polyalpha = (polygon->Attr >> 16) & 0x1F;
     bool wireframe = (polyalpha == 0);
 
-    bool (*fnDepthTest)(s32 dstz, s32 z, u32 dstattr);
-    if (polygon->Attr & (1<<14))
-        fnDepthTest = polygon->WBuffer ? DepthTest_Equal_W : DepthTest_Equal_Z;
-    else if (polygon->FacingView)
-        fnDepthTest = DepthTest_LessThan_FrontFacing;
-    else
-        fnDepthTest = DepthTest_LessThan;
+    const DepthTest depthTest(*polygon);
 
     PrevIsShadowMask = false;
 
@@ -1312,13 +1286,13 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
 
         // if depth test against the topmost pixel fails, test
         // against the pixel underneath
-        if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+        if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
         {
             if (!(dstattr & 0xF) || pixeladdr >= BufferSize) continue;
 
             pixeladdr += BufferSize;
             dstattr = AttrBuffer[pixeladdr];
-            if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+            if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
                 continue;
         }
 
@@ -1409,13 +1383,13 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
 
         // if depth test against the topmost pixel fails, test
         // against the pixel underneath
-        if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+        if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
         {
             if (!(dstattr & 0xF) || pixeladdr >= BufferSize) continue;
 
             pixeladdr += BufferSize;
             dstattr = AttrBuffer[pixeladdr];
-            if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+            if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
                 continue;
         }
 
@@ -1502,13 +1476,13 @@ void SoftRenderer3D::RenderPolygonScanline(RendererPolygon* rp, s32 y)
 
         // if depth test against the topmost pixel fails, test
         // against the pixel underneath
-        if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+        if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
         {
             if (!(dstattr & 0xF) || pixeladdr >= BufferSize) continue;
 
             pixeladdr += BufferSize;
             dstattr = AttrBuffer[pixeladdr];
-            if (!fnDepthTest(DepthBuffer[pixeladdr], z, dstattr))
+            if (!depthTest(DepthBuffer[pixeladdr], z, dstattr))
                 continue;
         }
 

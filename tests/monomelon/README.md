@@ -11,6 +11,17 @@ existing unsplit `SetX` path. It covers X/Y interpolation, Z/W buffering,
 linear and perspective modes, zero/wrapping spans, signed extremes and
 consecutive rejected pixels. It runs in the same CMake suite.
 
+The depth fixture includes the renderer implementation and compares its file-local
+predicate with the four original r9 predicates. It covers Z/W tolerance boundaries,
+facing/translucency flags, signed extremes and seeded random inputs. No generated
+headers or private files are required. Run it from the repository root with:
+
+```sh
+cmake -S tests/monomelon -B build/monomelon-tests -DCMAKE_BUILD_TYPE=Release
+cmake --build build/monomelon-tests --target test-Depth
+ctest --test-dir build/monomelon-tests -R '^Depth$' --output-on-failure
+```
+
 The `master` branch carries monoMelon changes based on JesseTG/melonDS commit
 `16f127dbb587a73371827ce79689c5d237c4b59b`. It adds the existing ARM64 NEON
 background-tile path and conservative sprite-priority mask from mono-overlay

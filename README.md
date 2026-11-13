@@ -26,6 +26,8 @@ This remains a work in progress, with emulation and rendering accuracy preserved
   vertex colour rounding and strip reuse.
 - Deferring perspective division until a pixel passes depth testing, while
   retaining the original interpolation arithmetic and W-buffer behavior.
+- Keeping software depth tests inline instead of calling through a function
+  pointer for each pixel, preserving depth tolerances and facing rules.
 
 [Regression tests](tests/monomelon) cover scheduler ordering, snapshots, generated
 JIT dispatch and rendering. Compiler tuning and open-demo PGO are provided by
