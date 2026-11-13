@@ -141,7 +141,7 @@ private:
     void BoxTest(const u32* params) noexcept;
     void PosTest() noexcept;
     void VecTest(u32 param) noexcept;
-    void CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept;
+    void CmdFIFOWrite(CmdFIFOEntry entry) noexcept;
     CmdFIFOEntry CmdFIFORead() noexcept;
     void FinishWork(s32 cycles) noexcept;
     void VertexPipelineSubmitCmd() noexcept

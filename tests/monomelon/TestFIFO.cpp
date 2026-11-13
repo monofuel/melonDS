@@ -19,6 +19,8 @@ static std::vector<u8> State(GPU3D& gpu)
     return {data, data + state.Length()};
 }
 
+#include "TestFifoValue.h"
+
 static void Check(bool geometry, bool rendering)
 {
     auto actual = std::make_unique<NDS>();
@@ -58,6 +60,7 @@ static void Check(bool geometry, bool rendering)
 
 int main()
 {
+    CheckFifoValue();
     Check(true, true);
     Check(true, false);
     Check(false, true);

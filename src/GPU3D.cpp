@@ -1715,7 +1715,7 @@ void GPU3D::VecTest(u32 param) noexcept
 
 
 
-void GPU3D::CmdFIFOWrite(const CmdFIFOEntry& entry) noexcept
+void GPU3D::CmdFIFOWrite(CmdFIFOEntry entry) noexcept
 {
     if (CmdFIFO.IsEmpty() && !CmdPIPE.IsFull())
     {

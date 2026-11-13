@@ -22,6 +22,8 @@ This remains a work in progress, with emulation and rendering accuracy preserved
 - Cached scheduler deadlines to avoid repeatedly scanning for the next event.
 - Shared AArch64 JIT dispatch tails to reduce housekeeping between compiled blocks.
 - Early geometry FIFO routing through the existing per-word register handler.
+- Passing small geometry FIFO entries by value so AArch64 callers can keep them
+  in registers, preserving queue contents, command timing and serialized state.
 - Skipping clipping passes for polygons already inside the view volume, preserving
   vertex colour rounding and strip reuse.
 - Deferring perspective division until a pixel passes depth testing, while
