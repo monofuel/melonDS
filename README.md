@@ -6,10 +6,15 @@ The [mono-overlay](https://github.com/monofuel/mono-overlay) Gentoo ebuild build
 the core; [mono-retro](https://github.com/monofuel/mono-retro) provides the Nim
 player with paired DRM/KMS display support.
 
+**Milestone:** monoMelon `1.4.0-r12` reaches native **100% speed** in Lost in Blue
+at all four tested savestate locations—**cliff, river, inventory and ocean**—on
+the **RG DS Plus** through mono-retro-player.
+See the [measured results](https://github.com/monofuel/mono-overlay/blob/master/docs/monomelon-performance.md).
+
 **Target:** Lost in Blue at native 100% speed on the **Anbernic RG DS Plus
 (RK3568 / Cortex-A55)** through mono-retro-player, with **5% extra processing
 headroom in each of four reference scenes**: cliff, river, inventory and ocean.
-This remains a work in progress, with emulation and rendering accuracy preserved.
+Broader gameplay validation remains in progress, with emulation and rendering accuracy preserved.
 
 ## Optimizations in this fork
 
